@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+data/users.json
+data/mcp_config*.json
+uploads/
+reports/
+*.log

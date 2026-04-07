@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Sign In — IQMS Chat{% endblock %}
+{% block body %}
+<div class="login-wrap">
+  <div class="login-card">
+    <h2><span>IQMS</span> Chat</h2>
+    <p style="text-align:center; color:var(--fg2); margin-bottom:1.5rem; font-size:0.85rem;">
+      Ask questions about your ERP data
+    </p>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in messages %}
+        <div class="flash flash-{{ cat }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+    <form method="POST">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" name="username" required autocomplete="username" autofocus>
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" name="password" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn btn-primary">Sign In</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
