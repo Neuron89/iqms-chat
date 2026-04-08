@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}Logs — IQMS Chat{% endblock %}
+{% block head %}
+<style>
+  .logs-container { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
+
+  .logs-toolbar {
+    display: flex; gap: 0.75rem; align-items: center; margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  .logs-toolbar select, .logs-toolbar input {
+    padding: 0.4rem 0.6rem; border-radius: var(--radius); border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 0.85rem;
+  }
+  .logs-toolbar select:focus, .logs-toolbar input:focus { border-color: var(--amber); outline: none; }
+  .logs-toolbar label { font-size: 0.8rem; color: var(--fg2); }
+
+  .log-count { font-size: 0.8rem; color: var(--fg2); margin-left: auto; }
+
+  .log-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; font-family: 'Courier New', monospace; }
+  .log-table th {
+    text-align: left; padding: 0.5rem 0.6rem; font-size: 0.75rem; font-weight: 600;
+    color: var(--fg2); text-transform: uppercase; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--bg);
+  }
+  .log-table td {
+    padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--bg3);
+    vertical-align: top; white-space: nowrap;
+  }
+  .log-table td.msg-col {
+    white-space: normal; word-break: break-word; max-width: 500px;
+  }
+  .log-table td.detail-col {
+    white-space: normal; word-break: break-word; max-width: 300px;
+    font-size: 0.78rem; color: var(--fg2);
+  }
+  .log-table tr:hover { background: var(--bg2); }
+
+  .level-INFO { color: var(--green); }
+  .level-WARN { color: var(--amber); }
+  .level-ERROR { color: var(--red); font-weight: 600; }
+
+  .auto-refresh { display: flex; align-items: center; gap: 0.3rem; font-size: 0.8rem; color: var(--fg2); }
+  .auto-refresh input { accent-color: var(--amber); }
+
+  .logs-scroll {
+    max-height: calc(100vh - 180px); overflow-y: auto;
+    border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .logs-scroll::-webkit-scrollbar { width: 6px; }
+  .logs-scroll::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+</style>
+{% endblock %}
+
+{% block body %}
+<nav class="navbar">
+  <h1><span>IQMS</span> Chat — Logs</h1>
+  <div class="nav-right">
+    <span>{{ display_name }}</span>
+    <a href="{{ url_for('chat') }}">Back to Chat</a>
+    <a href="{{ url_for('logout') }}">Sign out</a>
+  </div>
+</nav>
+
+<div class="logs-container">
+  <div class="logs-toolbar">
+    <label>Level:</label>
+    <select id="levelFilter" onchange="fetchLogs()">
+      <option value="">All</option>
+      <option value="INFO">INFO</option>
+      <option value="WARN">WARN</option>
+      <option value="ERROR">ERROR</option>
+    </select>
+    <label>User:</label>
+    <input type="text" id="userFilter" placeholder="filter by user" onchange="fetchLogs()" style="width:120px;">
+    <label class="auto-refresh">
+      <input type="checkbox" id="autoRefresh" checked> Auto-refresh
+    </label>
+    <button class="btn-sm" onclick="fetchLogs()">Refresh</button>
+    <span class="log-count" id="logCount"></span>
+  </div>
+
+  <div class="logs-scroll" id="logsScroll">
+    <table class="log-table">
+      <thead>
+        <tr>
+          <th style="width:145px;">Timestamp</th>
+          <th style="width:55px;">Level</th>
+          <th style="width:80px;">User</th>
+          <th>Message</th>
+          <th>Details</th>
+        </tr>
+      </thead>
+      <tbody id="logsBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+let refreshTimer = null;
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function fetchLogs() {
+  const level = document.getElementById('levelFilter').value;
+  const user = document.getElementById('userFilter').value.trim();
+  let url = '/api/logs?limit=300';
+  if (level) url += '&level=' + level;
+  if (user) url += '&user=' + encodeURIComponent(user);
+
+  try {
+    const resp = await fetch(url);
+    const logs = await resp.json();
+    const body = document.getElementById('logsBody');
+
+    body.innerHTML = logs.reverse().map(e => {
+      const details = Object.entries(e)
+        .filter(([k]) => !['timestamp','level','message','user'].includes(k))
+        .map(([k,v]) => `<b>${escapeHtml(k)}:</b> ${escapeHtml(String(v).substring(0, 200))}`)
+        .join('<br>');
+
+      return `<tr>
+        <td>${escapeHtml(e.timestamp)}</td>
+        <td class="level-${e.level}">${e.level}</td>
+        <td>${escapeHtml(e.user || '—')}</td>
+        <td class="msg-col">${escapeHtml(e.message)}</td>
+        <td class="detail-col">${details || '—'}</td>
+      </tr>`;
+    }).join('');
+
+    document.getElementById('logCount').textContent = `${logs.length} entries`;
+  } catch (err) {
+    console.error('Failed to fetch logs', err);
+  }
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    if (document.getElementById('autoRefresh').checked) fetchLogs();
+  }, 5000);
+}
+
+document.getElementById('autoRefresh').addEventListener('change', e => {
+  if (e.target.checked) startAutoRefresh();
+  else if (refreshTimer) clearInterval(refreshTimer);
+});
+
+fetchLogs();
+startAutoRefresh();
+</script>
+{% endblock %}
