@@ -19,6 +19,13 @@ from hashlib import sha256
 from pathlib import Path
 from functools import wraps
 
+from dotenv import load_dotenv
+
+# Load .env from the app directory before anything else reads os.environ.
+load_dotenv(Path(__file__).parent / ".env")
+
+import jwt as _jwt
+
 from flask import (
     Flask, render_template, request, redirect, url_for,
     session, flash, jsonify, send_from_directory,
@@ -312,6 +319,59 @@ def login():
         return redirect(url_for("chat"))
 
     return render_template("login.html")
+
+
+@app.route("/sso")
+def sso():
+    """
+    NYCOA Portal SSO landing. Verifies the portal-issued JWT, then logs the
+    visitor in as the hardcoded `admin` user (single-user setup for now;
+    real per-user accounts will replace this once IQMS chat gets its own
+    user store wired to the directory).
+    """
+    ptoken = request.args.get("ptoken", "")
+    next_path = request.args.get("next", "/")
+    if not ptoken:
+        flash("Missing SSO token. Open IQMS Chat from the portal.", "error")
+        return redirect(url_for("login"))
+
+    secret = os.environ.get("PORTAL_SSO_SECRET", "")
+    if not secret:
+        log_error("PORTAL_SSO_SECRET not configured — refusing SSO sign-in")
+        flash("SSO not configured on this server.", "error")
+        return redirect(url_for("login"))
+
+    try:
+        claims = _jwt.decode(
+            ptoken,
+            secret,
+            algorithms=["HS256"],
+            issuer="nycoa-portal",
+            audience="iqms_chat",
+        )
+    except _jwt.PyJWTError as exc:
+        log_warn(f"Rejected portal SSO token: {exc}")
+        flash("Invalid or expired SSO token. Click the IQMS Chat tile in the portal again.", "error")
+        return redirect(url_for("login"))
+
+    users = _load_users()
+    if "admin" not in users:
+        log_error("admin user missing from users.json — cannot complete SSO")
+        flash("Admin account not configured.", "error")
+        return redirect(url_for("login"))
+
+    admin_user = users["admin"]
+    session["username"] = "admin"
+    session["display_name"] = claims.get("full_name") or admin_user.get("display_name", "admin")
+    session["is_admin"] = bool(admin_user.get("is_admin"))
+    session["chat_id"] = str(uuid.uuid4())
+    session["eplant_id"] = "2"  # Default to Nycoa
+    session["sso_email"] = claims.get("email", "")
+    log_info(f"Portal SSO sign-in for {claims.get('email','?')} → admin")
+
+    if not next_path.startswith("/"):
+        next_path = "/"
+    return redirect(next_path)
 
 
 @app.route("/logout")
