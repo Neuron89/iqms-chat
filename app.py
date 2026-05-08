@@ -31,6 +31,8 @@ from flask import (
     session, flash, jsonify, send_from_directory,
 )
 
+import db  # SQLite persistence (auto-inits schema on import)
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
@@ -195,19 +197,78 @@ DO NOT try to answer it in one massive query. Instead:
 5. If a query returns too many rows, add ROWNUM or TOP limits and summarize
 
 Report Generation:
-When the user asks for a report, generate the data and format it as a clean, well-structured
-markdown document. At the very end of your response, output the report content between these
-exact markers on their own lines:
+When the user asks for a report, produce a polished, decision-ready markdown document — not
+a chat reply. The report must follow this structure exactly:
+
+1.  Title (H1) describing the topic and ePlant.
+2.  A "Report generated: YYYY-MM-DD HH:MM" line and an "ePlant: <name>" line directly under
+    the title.
+3.  An H2 "Executive Summary" of 2-3 sentences stating the headline finding and the period
+    covered. No filler phrases like "Here is the report you requested" — get straight to the
+    point.
+4.  Body sections grouped by topic (e.g. Production, Quality, Inventory, Costs) using H2/H3
+    markdown headers. Each section should answer one question. Lead with the data, follow
+    with one or two sentences of interpretation when warranted.
+5.  All tabular data presented as markdown tables with a clear header row. Right-align
+    numeric columns by using `---:` in the separator. Sort rows in a sensible order (e.g.
+    largest value first, or chronologically).
+6.  A "Data Quality Notes" H2 section if the underlying data has known anomalies (null
+    hours, cycle times >24 hrs, throughput >3x median, missing dates). Call them out
+    explicitly so a reader doesn't trust a flawed number.
+7.  An H2 "Methodology" section listing the IQMS tables/queries the data came from
+    (e.g. PDAYPROD, WORKORDER joined to ARINVT). Keep it brief — one or two lines.
+8.  A final line "Data source: IQMS / <module>" (e.g. "Data source: IQMS / Manufacturing").
+
+Formatting rules — apply consistently:
+- Numbers: thousands separators (`12,345`), currency as `$1,234.56`, percentages with one
+  decimal (`12.3%`), dates as `YYYY-MM-DD`, durations as `HH:MM` or `1.5 hrs`.
+- Result sets larger than 50 rows: show summary stats (total, average, min/max) plus the
+  top 10 rows as a sample. Add a line like "_Showing top 10 of 1,234 rows; full data summary
+  above._" so the reader knows it was truncated.
+- No emojis, no decorative dividers (`---` rules are fine but use sparingly).
+- No filler intros or sign-offs.
+
+Example skeleton:
+```
+# Production Summary — Nycoa
+Report generated: 2026-05-08 14:32
+ePlant: Nycoa
+
+## Executive Summary
+Nycoa produced 184,250 lbs across 47 work orders during the week of 2026-05-01 to 2026-05-07,
+a 6.2% increase over the prior week. Two work orders flagged with cycle anomalies are noted
+in Data Quality Notes.
+
+## Production by Line
+| Line   | Work Orders | Lbs Produced | Avg Cycle (hrs) |
+| :----- | ----------: | -----------: | --------------: |
+| RX-1   |          12 |       82,400 |             2.1 |
+| RX-2   |          10 |       55,300 |             2.4 |
+...
+
+## Data Quality Notes
+- WO 487211 has a recorded cycle of 31.2 hrs (flagged as outlier, excluded from averages).
+- 3 PDAYPROD rows have null END_DATETIME; treated as in-progress.
+
+## Methodology
+Pulled from IQMS.PDAYPROD joined to IQMS.WORKORDER, filtered EPLANT_ID = 2, week range above.
+
+Data source: IQMS / Manufacturing
+```
+
+After the report content, output it between these exact markers on their own lines so the
+system can save it as a downloadable file:
 
 ===REPORT_START===
-(report filename, e.g. production_summary_2025.md)
+<filename, format: <topic>_<eplant>_<YYYYMMDD>.md — e.g. production_summary_nycoa_20260508.md>
 ===REPORT_CONTENT===
-(full report content in markdown)
+<full report content in markdown, exactly as described above>
 ===REPORT_END===
 
-Then tell the user their report is ready for download. The system will automatically detect
-these markers and create a downloadable file. Use descriptive filenames with the ePlant name
-and date. For CSV data, use .csv extension instead of .md.
+Use lowercase ePlant name in the filename. For raw tabular dumps the user explicitly asked
+for as CSV, swap the extension to `.csv` and emit comma-separated values between the
+markers instead of markdown. After the markers, tell the user the report is ready for
+download — one short sentence.
 
 KNOWLEDGE BASE & MEMORY:
 You have access to an agent memory system at {agent_memory_dir}/ that contains institutional
@@ -247,8 +308,86 @@ or anything SCADA/historian related, use the dataPARC tools. You can combine IQM
 data in a single answer when relevant (e.g. correlating production records with process parameters).
 """
 
-# Store conversation histories in memory (keyed by session chat_id)
+# Store conversation histories in memory (keyed by session chat_id).
+# Kept for legacy view-state on the chat page; the source of truth is now SQLite (db.py).
 conversations: dict[str, list] = {}
+
+# Maximum prior-conversation block (chars) we'll inject into the user prompt.
+# Anything beyond this gets oldest-first truncated (preserving the most recent 4 turns).
+MAX_PRIOR_CONTEXT_CHARS = 30_000
+MIN_RECENT_TURNS_KEPT = 4
+
+
+def _format_prior_context(messages: list[dict]) -> str:
+    """
+    Format prior chat messages as the 'Prior Conversation' block we inject into
+    the user prompt. Truncates the oldest turns if the block would exceed
+    MAX_PRIOR_CONTEXT_CHARS — but always preserves the last MIN_RECENT_TURNS_KEPT
+    user/assistant pairs.
+
+    Returns "" when there are no prior messages.
+    """
+    if not messages:
+        return ""
+
+    # Group messages into 1-indexed turns. A "turn" here = one user msg + the
+    # assistant reply that follows. Use the user message's `turn` as the
+    # display number to match the DB.
+    pairs: list[tuple[int, str, str]] = []
+    pending_user: tuple[int, str] | None = None
+    for m in messages:
+        if m["role"] == "user":
+            if pending_user is not None:
+                # User asked twice with no assistant reply (rare) — flush the first
+                pairs.append((pending_user[0], pending_user[1], ""))
+            pending_user = (m["turn"], m["content"])
+        elif m["role"] == "assistant":
+            if pending_user is not None:
+                pairs.append((pending_user[0], pending_user[1], m["content"]))
+                pending_user = None
+            else:
+                # Orphan assistant — pair it with an empty user
+                pairs.append((m["turn"], "", m["content"]))
+    if pending_user is not None:
+        # In-flight user message that hasn't been answered yet (the one we're
+        # about to answer). Don't include it in prior context.
+        pass
+
+    if not pairs:
+        return ""
+
+    def render(pairs_subset: list[tuple[int, str, str]], truncated: bool) -> str:
+        lines = [
+            "=== Prior Conversation ===",
+            "The user has been chatting with you. Here is the conversation history so far. "
+            "Use this context to answer their next question coherently.",
+            "",
+        ]
+        if truncated:
+            lines.append("[... earlier turns truncated for length ...]")
+            lines.append("")
+        for turn_no, q, a in pairs_subset:
+            lines.append(f"[Turn {turn_no} - User]: {q}")
+            lines.append(f"[Turn {turn_no} - Assistant]: {a}")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    block = render(pairs, truncated=False)
+    if len(block) <= MAX_PRIOR_CONTEXT_CHARS:
+        return block
+
+    # Trim from the oldest end, but never drop the last MIN_RECENT_TURNS_KEPT pairs.
+    keep_floor = max(len(pairs) - MIN_RECENT_TURNS_KEPT, 0)
+    drop_idx = 0
+    while drop_idx < keep_floor:
+        drop_idx += 1
+        candidate = render(pairs[drop_idx:], truncated=True)
+        if len(candidate) <= MAX_PRIOR_CONTEXT_CHARS:
+            return candidate
+
+    # Even the floor (recent N) exceeds the cap — return it anyway so the model
+    # gets at least the most recent context. Better than nothing.
+    return render(pairs[keep_floor:], truncated=True)
 
 # ---------------------------------------------------------------------------
 # User store
@@ -566,17 +705,36 @@ def _extract_report(answer: str, username: str) -> tuple[str, str | None]:
 @app.route("/ask", methods=["POST"])
 @login_required
 def ask():
-    data = request.get_json()
-    question = data.get("question", "").strip()
-    attachments = data.get("attachments", [])
+    data = request.get_json() or {}
+    question = (data.get("question") or "").strip()
+    attachments = data.get("attachments") or []
     if not question:
         return jsonify({"error": "Empty question"}), 400
 
-    chat_id = session.get("chat_id", str(uuid.uuid4()))
-    if chat_id not in conversations:
-        conversations[chat_id] = []
-
     username = session["username"]
+    eplant_id_str = session.get("eplant_id", "1")
+    eplant = EPLANTS.get(eplant_id_str, EPLANTS["1"])
+    try:
+        eplant_id_int = int(eplant_id_str)
+    except (TypeError, ValueError):
+        eplant_id_int = 1
+
+    # Resolve chat_id: client-supplied (existing chat, ownership-checked) or new.
+    requested_chat_id = (data.get("chat_id") or "").strip() or None
+    chat_id: str
+    if requested_chat_id:
+        owned = db.get_chat(requested_chat_id, username)
+        if owned is None:
+            # Either doesn't exist or belongs to someone else — start a fresh chat
+            # rather than 403, so the UX falls forward gracefully.
+            chat_id = db.create_chat(username, eplant_id=eplant_id_int)
+        else:
+            chat_id = requested_chat_id
+    else:
+        chat_id = db.create_chat(username, eplant_id=eplant_id_int)
+
+    # Mirror chat_id in session for legacy in-memory views.
+    session["chat_id"] = chat_id
 
     # Build display content for user message (show attachment names)
     display_content = question
@@ -584,41 +742,44 @@ def ask():
         file_names = [a.get("original_name", a.get("name", "file")) for a in attachments]
         display_content = question + "\n\n📎 " + ", ".join(file_names)
 
-    # Add user message
-    conversations[chat_id].append({
-        "role": "user",
-        "content": display_content,
-        "timestamp": datetime.now().strftime("%H:%M"),
-    })
+    # Persist the user turn FIRST so it's durable even if Claude errors out.
+    db.add_message(
+        chat_id, "user", display_content,
+        attachments=attachments if attachments else None,
+    )
 
-    # Build the full prompt with file contents
-    full_prompt = question
+    # Pull prior turns (excluding the one we just inserted) for prompt injection.
+    all_msgs = db.get_messages(chat_id)
+    prior_msgs = all_msgs[:-1] if all_msgs else []
+    prior_context = _format_prior_context(prior_msgs)
+
+    # Build the full prompt: prior context (if any) + current question + attachments.
+    parts: list[str] = []
+    if prior_context:
+        parts.append(prior_context)
+        parts.append("=== Current Question ===")
+    parts.append(question)
+    full_prompt = "\n".join(parts)
 
     # Collect image/pdf file paths for Claude to read
-    file_paths_for_claude = []
+    file_paths_for_claude: list[str] = []
 
     for att in attachments:
         att_type = att.get("type")
         name = att.get("original_name", att.get("name", "file"))
 
         if att_type == "text":
-            # Inline text content
             content = att.get("content", "")
             full_prompt += f"\n\n--- Attached file: {name} ---\n{content}\n--- End of {name} ---"
 
         elif att_type in ("image", "pdf"):
-            # Claude CLI will read these via the Read tool
             fpath = att.get("path", "")
             if fpath and Path(fpath).exists():
                 file_paths_for_claude.append(fpath)
                 full_prompt += f"\n\n[Attached {att_type}: {name} — saved at {fpath}. Use the Read tool to view it.]"
 
-    # Build ePlant-specific system prompt
-    eplant_id = session.get("eplant_id", "1")
-    eplant = EPLANTS.get(eplant_id, EPLANTS["1"])
-
     # dataPARC only available for Nycoa (eplant 2)
-    is_nycoa = eplant_id == "2"
+    is_nycoa = eplant_id_str == "2"
     dataparc_section = DATAPARC_PROMPT_SECTION if is_nycoa else ""
     mcp_config_file = str(MCP_CONFIG_ALL) if is_nycoa else str(MCP_CONFIG_IQMS)
 
@@ -626,7 +787,7 @@ def ask():
     agent_memory = _load_core_memory()
 
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        eplant_id=eplant_id,
+        eplant_id=eplant_id_str,
         eplant_name=eplant["name"],
         eplant_company=eplant["company"],
         dataparc_section=dataparc_section,
@@ -639,7 +800,9 @@ def ask():
     prompt_file = DATA_DIR / f"prompt_{chat_id[:8]}.txt"
     prompt_file.write_text(system_prompt, encoding="utf-8")
 
-    # Build the claude command
+    # Build the claude command. Note: we own conversation context now via the
+    # injected "Prior Conversation" block in `full_prompt`, so we no longer pass
+    # --no-session-persistence (the flag is moot when we manage history ourselves).
     cmd = [
         "claude",
         "-p",
@@ -648,22 +811,19 @@ def ask():
         "--mcp-config", mcp_config_file,
         "--permission-mode", "bypassPermissions",
         "--system-prompt-file", str(prompt_file),
-        "--no-session-persistence",
         "--add-dir", str(AGENT_MEMORY_DIR),
         "--add-dir", str(IQMS_DOCS_DIR),
     ]
 
-    # Add file paths as allowed directories so Claude can read them
     for fpath in file_paths_for_claude:
         cmd.extend(["--add-dir", str(Path(fpath).parent)])
-
-    # Pass user's question via stdin (avoids CLI arg length limits)
 
     att_count = len(attachments)
     log_info(
         f"Query from '{username}': {question[:120]}{'...' if len(question) > 120 else ''}",
-        user=username, eplant=eplant["name"], model=CLAUDE_MODEL,
-        attachments=att_count, mcp="iqms+dataparc" if is_nycoa else "iqms",
+        user=username, chat_id=chat_id, eplant=eplant["name"], model=CLAUDE_MODEL,
+        attachments=att_count, prior_turns=len(prior_msgs),
+        mcp="iqms+dataparc" if is_nycoa else "iqms",
     )
 
     start_time = datetime.now()
@@ -690,7 +850,6 @@ def ask():
             try:
                 output = json.loads(result.stdout)
                 answer = output.get("result", result.stdout.strip())
-                # Log cost/usage info if available
                 usage = {k: v for k, v in output.items() if k != "result"}
                 log_info(
                     f"Query completed ({elapsed:.1f}s)",
@@ -721,22 +880,127 @@ def ask():
     # Check for report in the answer
     answer, report_url = _extract_report(answer, username)
     if report_url:
-        log_info(f"Report generated for '{username}'", report_url=report_url)
+        log_info(f"Report generated for '{username}'", report_url=report_url, chat_id=chat_id)
 
-    # Add assistant message
-    msg = {
-        "role": "assistant",
-        "content": answer,
-        "timestamp": datetime.now().strftime("%H:%M"),
+    # Persist the assistant turn (with report_url if any)
+    db.add_message(chat_id, "assistant", answer, report_url=report_url)
+
+    # Re-read the chat so we can return its (possibly auto-generated) title.
+    chat_row = db.get_chat(chat_id, username)
+    title = chat_row["title"] if chat_row else None
+
+    resp = {
+        "answer": answer,
+        "chat_id": chat_id,
+        "title": title,
     }
-    if report_url:
-        msg["report_url"] = report_url
-    conversations[chat_id].append(msg)
-
-    resp = {"answer": answer}
     if report_url:
         resp["report_url"] = report_url
     return jsonify(resp)
+
+
+# ---------------------------------------------------------------------------
+# Chat management API (sidebar uses these)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/chats", methods=["GET"])
+@login_required
+def api_list_chats():
+    username = session["username"]
+    chats = db.get_chats(username)
+    return jsonify(chats)
+
+
+@app.route("/api/chats", methods=["POST"])
+@login_required
+def api_create_chat():
+    username = session["username"]
+    data = request.get_json(silent=True) or {}
+    title = data.get("title")
+    eplant_id = data.get("eplant_id")
+    if eplant_id is None:
+        # Default to the user's current ePlant in session
+        try:
+            eplant_id = int(session.get("eplant_id", "1"))
+        except (TypeError, ValueError):
+            eplant_id = 1
+    else:
+        try:
+            eplant_id = int(eplant_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "eplant_id must be an integer"}), 400
+
+    chat_id = db.create_chat(username, eplant_id=eplant_id, title=title)
+    chat = db.get_chat(chat_id, username)
+    return jsonify({
+        "id": chat["id"],
+        "title": chat["title"],
+        "eplant_id": chat["eplant_id"],
+        "created_at": chat["created_at"],
+    })
+
+
+@app.route("/api/chats/<chat_id>", methods=["GET"])
+@login_required
+def api_get_chat(chat_id):
+    username = session["username"]
+    chat = db.get_chat(chat_id, username)
+    if chat is None:
+        return jsonify({"error": "Chat not found"}), 404
+    messages = db.get_messages(chat_id)
+    # Slim payload — sidebar/transcript view doesn't need the DB row id.
+    return jsonify({
+        "chat": {
+            "id": chat["id"],
+            "title": chat["title"],
+            "eplant_id": chat["eplant_id"],
+            "created_at": chat["created_at"],
+            "last_modified": chat["last_modified"],
+            "message_count": chat["message_count"],
+        },
+        "messages": [
+            {
+                "turn": m["turn"],
+                "role": m["role"],
+                "content": m["content"],
+                "report_url": m["report_url"],
+                "attachments": m["attachments"],
+                "timestamp": m["timestamp"],
+            }
+            for m in messages
+        ],
+    })
+
+
+@app.route("/api/chats/<chat_id>", methods=["PATCH"])
+@login_required
+def api_update_chat(chat_id):
+    username = session["username"]
+    data = request.get_json(silent=True) or {}
+    title = data.get("title")
+    if not title or not isinstance(title, str):
+        return jsonify({"error": "title is required"}), 400
+    title = title.strip()[:200] or "New chat"
+
+    # Ensure ownership before updating
+    if db.get_chat(chat_id, username) is None:
+        return jsonify({"error": "Chat not found"}), 404
+
+    db.update_chat_title(chat_id, username, title)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/chats/<chat_id>", methods=["DELETE"])
+@login_required
+def api_delete_chat(chat_id):
+    username = session["username"]
+    if db.get_chat(chat_id, username) is None:
+        return jsonify({"error": "Chat not found"}), 404
+    db.delete_chat(chat_id, username)
+    # Clear from session if it was the active chat
+    if session.get("chat_id") == chat_id:
+        session.pop("chat_id", None)
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------

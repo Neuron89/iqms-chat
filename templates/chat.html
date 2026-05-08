@@ -2,23 +2,157 @@
 {% block title %}IQMS Chat{% endblock %}
 {% block head %}
 <style>
-  .chat-layout {
-    display: flex; flex-direction: column; height: calc(100vh - 53px);
+  /* === Layout === */
+  .chat-shell {
+    display: flex; height: calc(100vh - 53px); position: relative;
+  }
+
+  /* === Sidebar === */
+  .sidebar {
+    width: 280px; flex-shrink: 0;
+    background: var(--bg2); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    transition: transform 0.2s ease;
+  }
+  .sidebar-header {
+    padding: 0.85rem 0.85rem 0.6rem; border-bottom: 1px solid var(--border);
+  }
+  .new-chat-btn {
+    width: 100%; padding: 0.6rem 0.75rem; border-radius: var(--radius);
+    background: var(--amber); color: #000; border: none; cursor: pointer;
+    font-family: var(--font); font-size: 0.9rem; font-weight: 700;
+    display: flex; align-items: center; justify-content: center; gap: 0.4rem;
+    transition: background 0.15s;
+  }
+  .new-chat-btn:hover { background: #d97706; }
+  .new-chat-btn svg { width: 16px; height: 16px; }
+
+  .sidebar-list {
+    flex: 1; overflow-y: auto; padding: 0.4rem 0.4rem 1rem;
+  }
+  .sidebar-list::-webkit-scrollbar { width: 6px; }
+  .sidebar-list::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 3px; }
+
+  .sidebar-section-label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--fg2); padding: 0.6rem 0.6rem 0.3rem; font-weight: 600;
+  }
+
+  .chat-row {
+    position: relative; display: flex; flex-direction: column; gap: 0.15rem;
+    padding: 0.55rem 0.6rem 0.55rem 0.7rem; border-radius: 6px;
+    cursor: pointer; border-left: 3px solid transparent;
+    transition: background 0.12s;
+  }
+  .chat-row:hover { background: var(--bg3); }
+  .chat-row.active {
+    background: rgba(245, 158, 11, 0.10); border-left-color: var(--amber);
+  }
+  .chat-row-title {
+    font-size: 0.86rem; color: var(--fg); font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    padding-right: 1.6rem;
+  }
+  .chat-row-title input {
+    width: 100%; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--amber); border-radius: 4px;
+    padding: 0.15rem 0.35rem; font-size: 0.85rem; font-family: var(--font);
+    outline: none;
+  }
+  .chat-row-meta {
+    display: flex; align-items: center; gap: 0.4rem;
+    font-size: 0.7rem; color: var(--fg2);
+  }
+  .chat-row-time { font-variant-numeric: tabular-nums; }
+  .eplant-badge {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    padding: 0.05rem 0.4rem; border-radius: 999px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+  .eplant-badge.eplant-1 { background: rgba(59, 130, 246, 0.18); color: #93c5fd; }
+  .eplant-badge.eplant-2 { background: rgba(245, 158, 11, 0.18); color: var(--amber); }
+  .eplant-badge.eplant-3 { background: rgba(34, 197, 94, 0.18); color: #86efac; }
+
+  .chat-row-actions {
+    position: absolute; top: 0.45rem; right: 0.4rem;
+    display: none; gap: 0.1rem;
+  }
+  .chat-row:hover .chat-row-actions { display: flex; }
+  .chat-row.active .chat-row-actions { display: flex; }
+  .row-action {
+    background: transparent; border: none; cursor: pointer;
+    padding: 0.2rem; border-radius: 4px; color: var(--fg2);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .row-action:hover { background: var(--bg2); color: var(--amber); }
+  .row-action.danger:hover { color: var(--red); }
+  .row-action svg { width: 13px; height: 13px; }
+
+  .sidebar-empty {
+    padding: 1.5rem 1rem; text-align: center; color: var(--fg2);
+    font-size: 0.82rem; line-height: 1.45;
+  }
+
+  /* Hamburger / mobile toggle */
+  .sidebar-toggle {
+    display: none;
+    position: absolute; top: 0.55rem; left: 0.6rem; z-index: 30;
+    background: var(--bg2); border: 1px solid var(--border);
+    color: var(--fg); padding: 0.35rem 0.55rem; border-radius: 6px;
+    cursor: pointer;
+  }
+  .sidebar-toggle svg { width: 18px; height: 18px; display: block; }
+  .sidebar-backdrop {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    z-index: 19;
+  }
+
+  /* === Main column === */
+  .chat-main {
+    flex: 1; display: flex; flex-direction: column; min-width: 0;
   }
 
   .eplant-bar {
-    padding: 0.5rem 1.5rem; background: var(--bg2); border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 0.75rem; font-size: 0.85rem;
+    padding: 0.55rem 1.5rem; background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 0.75rem;
+    font-size: 0.85rem; flex-wrap: wrap;
+  }
+  .eplant-active {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.25rem 0.6rem; border-radius: 999px;
+    font-size: 0.78rem; font-weight: 700;
+    border: 1px solid transparent;
+  }
+  .eplant-active.eplant-1 {
+    background: rgba(59, 130, 246, 0.15); color: #93c5fd; border-color: rgba(59,130,246,0.4);
+  }
+  .eplant-active.eplant-2 {
+    background: rgba(245, 158, 11, 0.15); color: var(--amber); border-color: rgba(245,158,11,0.4);
+  }
+  .eplant-active.eplant-3 {
+    background: rgba(34, 197, 94, 0.15); color: #86efac; border-color: rgba(34,197,94,0.4);
+  }
+  .eplant-active .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: currentColor;
   }
   .eplant-bar label { color: var(--fg2); font-weight: 500; }
   .eplant-select {
-    padding: 0.35rem 0.6rem; border-radius: var(--radius); border: 1px solid var(--border);
-    background: var(--bg); color: var(--amber); font-family: var(--font); font-size: 0.85rem;
+    padding: 0.3rem 0.55rem; border-radius: var(--radius); border: 1px solid var(--border);
+    background: var(--bg); color: var(--amber); font-family: var(--font); font-size: 0.82rem;
     font-weight: 600; outline: none; cursor: pointer;
   }
   .eplant-select:focus { border-color: var(--amber); }
-  .eplant-status { color: var(--fg2); font-size: 0.8rem; }
+  .eplant-status { color: var(--fg2); font-size: 0.78rem; }
+  .eplant-warn {
+    margin-left: auto; padding: 0.25rem 0.55rem; border-radius: 6px;
+    background: rgba(239, 68, 68, 0.15); color: #fca5a5; font-size: 0.75rem;
+    border: 1px solid rgba(239,68,68,0.35); display: none;
+  }
+  .eplant-warn.show { display: inline-flex; align-items: center; gap: 0.35rem; }
 
+  /* === Messages === */
   .chat-messages {
     flex: 1; overflow-y: auto; padding: 1.5rem;
     display: flex; flex-direction: column; gap: 1rem;
@@ -77,8 +211,20 @@
   .msg-bubble h2 { font-size: 1rem; }
   .msg-bubble h3 { font-size: 0.95rem; }
 
-  .msg-time { font-size: 0.7rem; color: var(--fg2); margin-top: 0.25rem; }
-  .msg-user .msg-time { text-align: right; }
+  .msg-footer {
+    display: flex; align-items: center; gap: 0.6rem; margin-top: 0.3rem;
+    font-size: 0.7rem; color: var(--fg2);
+  }
+  .msg-user .msg-footer { justify-content: flex-end; }
+  .copy-btn {
+    background: transparent; border: none; color: var(--fg2);
+    font-size: 0.7rem; cursor: pointer; padding: 0.15rem 0.3rem;
+    border-radius: 4px; display: inline-flex; align-items: center; gap: 0.25rem;
+    font-family: var(--font);
+  }
+  .copy-btn:hover { color: var(--amber); background: var(--bg3); }
+  .copy-btn svg { width: 12px; height: 12px; }
+  .copy-btn.copied { color: var(--green); }
 
   .report-download {
     display: inline-flex; align-items: center; gap: 0.4rem;
@@ -102,6 +248,7 @@
   .export-btn.exporting { opacity: 0.5; pointer-events: none; }
   .export-btn svg { width: 13px; height: 13px; }
 
+  /* === Typing / progressive status === */
   .typing-indicator {
     display: flex; gap: 0.75rem; align-self: flex-start; max-width: 85%;
   }
@@ -109,7 +256,7 @@
     padding: 0.75rem 1rem;
     background: var(--bg2); border: 1px solid var(--border);
     border-radius: 12px; border-bottom-left-radius: 4px;
-    display: flex; flex-direction: column; gap: 0.4rem;
+    display: flex; flex-direction: column; gap: 0.4rem; min-width: 240px;
   }
   .typing-dots-row {
     display: flex; gap: 4px; align-items: center;
@@ -121,13 +268,21 @@
   .typing-dots-row span:nth-child(2) { animation-delay: 0.2s; }
   .typing-dots-row span:nth-child(3) { animation-delay: 0.4s; }
   .typing-status {
-    font-size: 0.78rem; color: var(--fg2); display: flex; align-items: center; gap: 0.5rem;
+    font-size: 0.78rem; color: var(--fg2); display: flex; align-items: center;
+    justify-content: space-between; gap: 0.5rem;
   }
-  .typing-timer {
-    font-variant-numeric: tabular-nums; color: var(--amber); font-weight: 600;
-    font-size: 0.75rem;
+  .typing-status-text { flex: 1; }
+  .typing-progress {
+    height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden;
+    position: relative;
+  }
+  .typing-progress::after {
+    content: ''; position: absolute; top: 0; left: -40%;
+    height: 100%; width: 40%; background: var(--amber);
+    animation: indeterminate 1.6s ease-in-out infinite;
   }
 
+  /* === Input === */
   .chat-input-area {
     padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--bg2);
   }
@@ -135,7 +290,7 @@
     display: flex; gap: 0.75rem; max-width: 900px; margin: 0 auto; align-items: flex-end;
   }
   .chat-input-col {
-    flex: 1; display: flex; flex-direction: column; gap: 0.4rem;
+    flex: 1; display: flex; flex-direction: column; gap: 0.4rem; min-width: 0;
   }
   .chat-input {
     width: 100%; padding: 0.75rem 1rem; border-radius: var(--radius);
@@ -182,27 +337,72 @@
   .send-btn:hover { background: #d97706; }
   .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+  /* === Welcome / empty state === */
   .welcome {
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    flex: 1; color: var(--fg2); gap: 0.75rem; padding: 2rem;
+    flex: 1; color: var(--fg2); gap: 0.6rem; padding: 2rem; text-align: center;
   }
-  .welcome h2 { color: var(--fg); font-size: 1.3rem; }
+  .welcome-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.75rem 1.5rem; max-width: 640px; width: 100%;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.02);
+  }
+  .welcome h2 { color: var(--fg); font-size: 1.35rem; margin-bottom: 0.25rem; }
   .welcome h2 span { color: var(--amber); }
+  .welcome p { font-size: 0.88rem; line-height: 1.5; }
   .welcome-examples {
-    display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin-top: 0.5rem;
-    max-width: 700px;
+    display: flex; flex-direction: column; gap: 0.5rem; margin-top: 1.1rem;
   }
   .example-btn {
-    padding: 0.5rem 0.75rem; border-radius: var(--radius); border: 1px solid var(--border);
-    background: var(--bg2); color: var(--fg2); font-size: 0.8rem; cursor: pointer;
-    font-family: var(--font); transition: all 0.15s;
+    text-align: left; padding: 0.65rem 0.85rem; border-radius: var(--radius);
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--fg); font-size: 0.85rem; cursor: pointer;
+    font-family: var(--font); transition: all 0.15s; line-height: 1.4;
   }
-  .example-btn:hover { border-color: var(--amber); color: var(--fg); }
+  .example-btn:hover {
+    border-color: var(--amber); color: var(--fg);
+    background: rgba(245, 158, 11, 0.05);
+  }
+  .example-btn .ex-icon {
+    color: var(--amber); margin-right: 0.4rem; font-weight: 700;
+  }
 
   @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes bounce {
     0%, 60%, 100% { transform: translateY(0); }
     30% { transform: translateY(-6px); }
+  }
+  @keyframes indeterminate {
+    0% { left: -40%; }
+    100% { left: 100%; }
+  }
+
+  /* === Light mode === */
+  html[data-theme="light"] .sidebar { background: #f3f4f6; }
+  html[data-theme="light"] .chat-row.active { background: rgba(245, 158, 11, 0.14); }
+  html[data-theme="light"] .row-action:hover { background: #e5e7eb; }
+  html[data-theme="light"] .welcome-card { background: #fff; }
+
+  /* === Responsive === */
+  @media (max-width: 768px) {
+    .sidebar-toggle { display: inline-flex; }
+    .eplant-bar { padding-left: 3rem; }
+    .sidebar {
+      position: fixed; top: 53px; left: 0; bottom: 0; z-index: 20;
+      transform: translateX(-100%); width: 85%; max-width: 320px;
+      box-shadow: 4px 0 20px rgba(0,0,0,0.4);
+    }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop.open { display: block; }
+    .chat-messages { padding: 1rem; }
+    .chat-input-area { padding: 0.75rem 1rem; }
+    .msg { max-width: 95%; }
+    .welcome { padding: 1rem; }
+  }
+  @media (max-width: 400px) {
+    .chat-input-wrap { gap: 0.4rem; }
+    .upload-btn { padding: 0 0.55rem; }
+    .send-btn { padding: 0 0.85rem; }
   }
 </style>
 {% endblock %}
@@ -212,9 +412,6 @@
   <h1><span>IQMS</span> Chat</h1>
   <div class="nav-right">
     <span>{{ display_name }}</span>
-    <form method="POST" action="{{ url_for('new_chat') }}" style="display:inline;">
-      <button type="submit" class="btn-sm" title="Start new conversation">New Chat</button>
-    </form>
     {% if session.get('is_admin') %}
       <a href="{{ url_for('view_logs') }}">Logs</a>
       <a href="{{ url_for('admin') }}">Admin</a>
@@ -223,95 +420,547 @@
   </div>
 </nav>
 
-<div class="chat-layout">
-  <div class="eplant-bar">
-    <label for="eplantSelect">ePlant:</label>
-    <select class="eplant-select" id="eplantSelect" onchange="changeEplant(this.value)">
-      {% for eid, edata in eplants.items() %}
-        <option value="{{ eid }}" {% if eid == current_eplant %}selected{% endif %}>
-          {{ edata.name }} ({{ edata.company }})
-        </option>
-      {% endfor %}
-    </select>
-    <span class="eplant-status" id="eplantStatus"></span>
-  </div>
+<div class="chat-shell">
+  <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle chat history" onclick="toggleSidebar()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/>
+    </svg>
+  </button>
+  <div class="sidebar-backdrop" id="sidebarBackdrop" onclick="toggleSidebar(false)"></div>
 
-  {% with msgs = get_flashed_messages(with_categories=true) %}
-    {% for cat, msg in msgs %}
-      <div class="flash flash-{{ cat }}" style="margin:1rem 1.5rem 0;">{{ msg }}</div>
-    {% endfor %}
-  {% endwith %}
-
-  <div class="chat-messages" id="chatMessages">
-    {% if not messages %}
-    <div class="welcome" id="welcome">
-      <h2>Ask <span>IQMS</span> anything</h2>
-      <p>Query production data, work orders, quality records, and more.</p>
-      <p style="font-size:0.8rem;">Select your ePlant above, then ask a question below.</p>
-      <div class="welcome-examples">
-        <button class="example-btn" onclick="useExample(this)">How many work orders were created this month?</button>
-        <button class="example-btn" onclick="useExample(this)">Show me the top 10 parts by production volume this year</button>
-        <button class="example-btn" onclick="useExample(this)">What tables are related to quality inspections?</button>
-        <button class="example-btn" onclick="useExample(this)">Generate a report of all open purchase orders over $10,000</button>
-      </div>
-    </div>
-    {% else %}
-      {% for msg in messages %}
-      <div class="msg msg-{{ msg.role }}">
-        <div class="msg-avatar">{{ 'You' if msg.role == 'user' else 'AI' }}</div>
-        <div>
-          <div class="msg-bubble">{{ msg.content }}</div>
-          {% if msg.get('report_url') %}
-          <a class="report-download" href="{{ msg.report_url }}">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-            Download Report
-          </a>
-          {% endif %}
-          <div class="msg-time">{{ msg.timestamp }}</div>
-        </div>
-      </div>
-      {% endfor %}
-    {% endif %}
-  </div>
-
-  <div class="chat-input-area">
-    <div class="chat-input-wrap">
-      <input type="file" id="fileInput" style="display:none;" multiple
-             accept=".png,.jpg,.jpeg,.gif,.bmp,.webp,.docx,.xlsx,.xls,.csv,.txt,.md,.json,.xml,.yaml,.yml,.pdf">
-      <button class="upload-btn" onclick="document.getElementById('fileInput').click()" title="Attach file">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+  <aside class="sidebar" id="sidebar" aria-label="Chat history">
+    <div class="sidebar-header">
+      <button class="new-chat-btn" id="newChatBtn" onclick="startNewChat()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
         </svg>
+        New Chat
       </button>
-      <div class="chat-input-col">
-        <div class="attachments-bar" id="attachmentsBar"></div>
-        <textarea class="chat-input" id="chatInput" placeholder="Ask about your ERP data..."
-                  rows="1" autofocus></textarea>
+    </div>
+    <div class="sidebar-list" id="chatList">
+      <div class="sidebar-empty" id="chatListEmpty">No past conversations yet</div>
+    </div>
+  </aside>
+
+  <div class="chat-main">
+    <div class="eplant-bar">
+      <span class="eplant-active eplant-{{ current_eplant }}" id="eplantBadge">
+        <span class="dot"></span>
+        <span id="eplantBadgeName">{{ eplants[current_eplant].name }}</span>
+      </span>
+      <label for="eplantSelect">Switch:</label>
+      <select class="eplant-select" id="eplantSelect" onchange="changeEplant(this.value)">
+        {% for eid, edata in eplants.items() %}
+          <option value="{{ eid }}" {% if eid == current_eplant %}selected{% endif %}>
+            {{ edata.name }} ({{ edata.company }})
+          </option>
+        {% endfor %}
+      </select>
+      <span class="eplant-status" id="eplantStatus"></span>
+      <span class="eplant-warn" id="eplantWarn" title="ePlant changed mid-conversation">
+        ePlant changed mid-conversation — Claude may be confused. Consider starting a new chat.
+      </span>
+    </div>
+
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in msgs %}
+        <div class="flash flash-{{ cat }}" style="margin:1rem 1.5rem 0;">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="chat-messages" id="chatMessages"></div>
+
+    <div class="chat-input-area">
+      <div class="chat-input-wrap">
+        <input type="file" id="fileInput" style="display:none;" multiple
+               accept=".png,.jpg,.jpeg,.gif,.bmp,.webp,.docx,.xlsx,.xls,.csv,.txt,.md,.json,.xml,.yaml,.yml,.pdf">
+        <button class="upload-btn" onclick="document.getElementById('fileInput').click()" title="Attach file">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+          </svg>
+        </button>
+        <div class="chat-input-col">
+          <div class="attachments-bar" id="attachmentsBar"></div>
+          <textarea class="chat-input" id="chatInput" placeholder="Ask about your ERP data..."
+                    rows="1" autofocus></textarea>
+        </div>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send">&#10148;</button>
       </div>
-      <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send">&#10148;</button>
     </div>
   </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
+// === DOM refs ===
 const chatMessages = document.getElementById('chatMessages');
 const chatInput = document.getElementById('chatInput');
 const sendBtn = document.getElementById('sendBtn');
 const fileInput = document.getElementById('fileInput');
 const attachmentsBar = document.getElementById('attachmentsBar');
-let isWaiting = false;
-let pendingAttachments = [];  // processed file data ready to send
+const chatList = document.getElementById('chatList');
+const chatListEmpty = document.getElementById('chatListEmpty');
+const sidebar = document.getElementById('sidebar');
+const sidebarBackdrop = document.getElementById('sidebarBackdrop');
+const eplantSelect = document.getElementById('eplantSelect');
+const eplantBadge = document.getElementById('eplantBadge');
+const eplantBadgeName = document.getElementById('eplantBadgeName');
+const eplantWarn = document.getElementById('eplantWarn');
 
-// File upload handling
+const EPLANTS = {
+  {% for eid, edata in eplants.items() -%}
+  "{{ eid }}": { name: "{{ edata.name }}", company: "{{ edata.company|e }}" }{% if not loop.last %},{% endif %}
+  {% endfor %}
+};
+
+let isWaiting = false;
+let pendingAttachments = [];
+let activeChatId = null;
+let chats = [];                 // sidebar list cache
+let currentEplant = "{{ current_eplant }}";
+let chatStartEplant = currentEplant;
+let messageCount = 0;           // messages currently rendered
+
+// === Time helper ===
+function relativeTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const diff = (now - d) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400 && now.getDate() === d.getDate()) return Math.floor(diff / 3600) + 'h ago';
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  if (diff < 86400 * 7) return d.toLocaleDateString([], { weekday: 'short' });
+  if (d.getFullYear() === now.getFullYear()) return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
+}
+function timeOfDay(iso) {
+  const d = iso ? new Date(iso) : new Date();
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// === Sidebar: list management ===
+async function loadChatList() {
+  try {
+    const resp = await fetch('/api/chats', { headers: { 'Accept': 'application/json' } });
+    if (!resp.ok) throw new Error('not ok');
+    chats = await resp.json();
+    if (!Array.isArray(chats)) chats = [];
+  } catch (e) {
+    chats = []; // graceful degrade if backend not deployed
+  }
+  renderChatList();
+}
+
+function renderChatList() {
+  chatList.innerHTML = '';
+  if (!chats.length) {
+    const empty = document.createElement('div');
+    empty.className = 'sidebar-empty';
+    empty.id = 'chatListEmpty';
+    empty.textContent = 'No past conversations yet';
+    chatList.appendChild(empty);
+    return;
+  }
+  chats.forEach(c => chatList.appendChild(renderChatRow(c)));
+}
+
+function renderChatRow(c) {
+  const row = document.createElement('div');
+  row.className = 'chat-row' + (String(c.id) === String(activeChatId) ? ' active' : '');
+  row.dataset.id = c.id;
+  row.onclick = (e) => {
+    if (e.target.closest('.row-action') || e.target.closest('input')) return;
+    openChat(c.id);
+  };
+
+  const eid = String(c.eplant_id || '1');
+  const eName = (EPLANTS[eid] || { name: 'ePlant' }).name;
+  const title = c.title && c.title.length > 40 ? c.title.slice(0, 39) + '…' : (c.title || 'Untitled');
+
+  row.innerHTML = `
+    <div class="chat-row-title" title="${escapeHtml(c.title || 'Untitled')}">${escapeHtml(title)}</div>
+    <div class="chat-row-meta">
+      <span class="eplant-badge eplant-${escapeHtml(eid)}">${escapeHtml(eName)}</span>
+      <span class="chat-row-time">${escapeHtml(relativeTime(c.last_modified || c.created_at))}</span>
+    </div>
+    <div class="chat-row-actions">
+      <button class="row-action" title="Rename" aria-label="Rename">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4z"/></svg>
+      </button>
+      <button class="row-action danger" title="Delete" aria-label="Delete">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+      </button>
+    </div>
+  `;
+  const actions = row.querySelectorAll('.row-action');
+  actions[0].onclick = (e) => { e.stopPropagation(); beginRename(row, c); };
+  actions[1].onclick = (e) => { e.stopPropagation(); deleteChat(c); };
+  return row;
+}
+
+function beginRename(row, c) {
+  const titleEl = row.querySelector('.chat-row-title');
+  const original = c.title || 'Untitled';
+  titleEl.innerHTML = `<input type="text" value="${escapeHtml(original)}" maxlength="120">`;
+  const input = titleEl.querySelector('input');
+  input.focus();
+  input.select();
+  const commit = async () => {
+    const next = (input.value || '').trim();
+    if (!next || next === original) { renderChatList(); return; }
+    try {
+      const resp = await fetch('/api/chats/' + encodeURIComponent(c.id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: next }),
+      });
+      if (resp.ok) {
+        c.title = next;
+        const idx = chats.findIndex(x => String(x.id) === String(c.id));
+        if (idx >= 0) chats[idx].title = next;
+      }
+    } catch (e) { /* graceful */ }
+    renderChatList();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { renderChatList(); }
+  });
+  input.addEventListener('blur', commit);
+}
+
+async function deleteChat(c) {
+  if (!confirm('Delete this conversation? This cannot be undone.')) return;
+  try {
+    const resp = await fetch('/api/chats/' + encodeURIComponent(c.id), { method: 'DELETE' });
+    if (!resp.ok) throw new Error('not ok');
+  } catch (e) {
+    alert('Delete failed.');
+    return;
+  }
+  chats = chats.filter(x => String(x.id) !== String(c.id));
+  if (String(activeChatId) === String(c.id)) {
+    activeChatId = null;
+    clearMessages();
+    renderWelcome();
+  }
+  renderChatList();
+}
+
+// === Sidebar: open / new ===
+async function openChat(id) {
+  if (String(id) === String(activeChatId)) { closeMobileSidebar(); return; }
+  try {
+    const resp = await fetch('/api/chats/' + encodeURIComponent(id));
+    if (!resp.ok) throw new Error('not ok');
+    const data = await resp.json();
+    activeChatId = data.chat ? data.chat.id : id;
+    const eid = String((data.chat && data.chat.eplant_id) || '1');
+    setEplantUI(eid, /*silent*/ true);
+    chatStartEplant = eid;
+    eplantWarn.classList.remove('show');
+    clearMessages();
+    const msgs = (data.messages || []).slice().sort((a, b) => (a.turn || 0) - (b.turn || 0));
+    msgs.forEach(m => {
+      addMessage(m.role, m.content, m.timestamp, m.report_url, /*persist*/ true);
+    });
+    if (!msgs.length) renderWelcome();
+  } catch (e) {
+    // graceful: just set the id and clear
+    activeChatId = id;
+    clearMessages();
+    renderWelcome();
+  }
+  renderChatList();
+  closeMobileSidebar();
+}
+
+function startNewChat() {
+  activeChatId = null;
+  chatStartEplant = currentEplant;
+  eplantWarn.classList.remove('show');
+  clearMessages();
+  renderWelcome();
+  renderChatList();
+  closeMobileSidebar();
+  chatInput.focus();
+}
+
+// === Messages ===
+function clearMessages() {
+  chatMessages.innerHTML = '';
+  messageCount = 0;
+}
+
+function renderWelcome() {
+  const wrap = document.createElement('div');
+  wrap.className = 'welcome';
+  wrap.id = 'welcome';
+  wrap.innerHTML = `
+    <div class="welcome-card">
+      <h2>Ask <span>IQMS</span> anything</h2>
+      <p>Query production data, work orders, quality records, and more for the active ePlant.</p>
+      <div class="welcome-examples">
+        <button class="example-btn" onclick="useExample(this)"><span class="ex-icon">&rsaquo;</span>Show me top 10 customers by revenue YTD</button>
+        <button class="example-btn" onclick="useExample(this)"><span class="ex-icon">&rsaquo;</span>List open work orders for the active ePlant</button>
+        <button class="example-btn" onclick="useExample(this)"><span class="ex-icon">&rsaquo;</span>Generate a quality summary for last week</button>
+      </div>
+    </div>
+  `;
+  chatMessages.appendChild(wrap);
+}
+
+function addMessage(role, content, time, reportUrl, persist) {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const div = document.createElement('div');
+  div.className = `msg msg-${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'msg-avatar';
+  avatar.textContent = role === 'user' ? 'You' : 'AI';
+
+  const inner = document.createElement('div');
+  inner.style.minWidth = '0';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  if (role === 'assistant') {
+    try { bubble.innerHTML = marked.parse(content || ''); }
+    catch (e) { bubble.textContent = content || ''; }
+  } else {
+    bubble.textContent = content || '';
+  }
+  inner.appendChild(bubble);
+
+  if (reportUrl) {
+    const dl = document.createElement('a');
+    dl.className = 'report-download';
+    dl.href = reportUrl;
+    dl.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+    </svg> Download Report`;
+    inner.appendChild(dl);
+  }
+
+  if (role === 'assistant' && content && !content.startsWith('Sorry') && !content.startsWith('Connection error')) {
+    const exportBar = document.createElement('div');
+    exportBar.className = 'export-bar';
+    div.dataset.rawContent = content;
+    const formats = [
+      { fmt: 'pdf',  label: 'PDF',   icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' },
+      { fmt: 'docx', label: 'Word',  icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
+      { fmt: 'xlsx', label: 'Excel', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>' },
+    ];
+    formats.forEach(({fmt, label, icon}) => {
+      const btn = document.createElement('button');
+      btn.className = 'export-btn';
+      btn.innerHTML = `${icon} ${label}`;
+      btn.onclick = () => exportMessage(btn, content, fmt);
+      exportBar.appendChild(btn);
+    });
+    inner.appendChild(exportBar);
+  }
+
+  // Footer: timestamp + copy
+  const footer = document.createElement('div');
+  footer.className = 'msg-footer';
+  const ts = document.createElement('span');
+  ts.className = 'msg-time';
+  ts.textContent = time && /^\d/.test(time) && !time.includes(':') ? timeOfDay(time) : (time || timeOfDay());
+  footer.appendChild(ts);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'copy-btn';
+  copyBtn.title = 'Copy message';
+  copyBtn.innerHTML = `
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+    <span>Copy</span>`;
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(content || '');
+      copyBtn.classList.add('copied');
+      copyBtn.querySelector('span').textContent = 'Copied';
+      setTimeout(() => {
+        copyBtn.classList.remove('copied');
+        const span = copyBtn.querySelector('span');
+        if (span) span.textContent = 'Copy';
+      }, 1500);
+    } catch (e) { /* clipboard blocked */ }
+  };
+  footer.appendChild(copyBtn);
+  inner.appendChild(footer);
+
+  div.appendChild(avatar);
+  div.appendChild(inner);
+  chatMessages.appendChild(div);
+  messageCount++;
+  scrollToBottom();
+}
+
+function scrollToBottom() {
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// === Typing / progressive status ===
+let typingTimer = null;
+let typingStart = 0;
+
+const STATUS_MESSAGES = [
+  { after: 0,   text: 'Connecting to IQMS...' },
+  { after: 5,   text: 'Querying IQMS database...' },
+  { after: 15,  text: 'Analyzing data...' },
+  { after: 30,  text: 'Still working — large queries can take up to 5 minutes.' },
+  { after: 90,  text: 'Crunching across multiple tables — hang tight.' },
+  { after: 180, text: 'Almost there — pulling the results together.' },
+  { after: 270, text: 'Wrapping up...' },
+];
+
+function showTyping() {
+  const div = document.createElement('div');
+  div.className = 'typing-indicator';
+  div.id = 'typingIndicator';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'msg-avatar';
+  avatar.style.background = 'var(--navy)';
+  avatar.style.border = '1px solid var(--border)';
+  avatar.textContent = 'AI';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'typing-bubble';
+  bubble.innerHTML = `
+    <div class="typing-dots-row"><span></span><span></span><span></span></div>
+    <div class="typing-status">
+      <span class="typing-status-text" id="typingStatusText">Connecting to IQMS...</span>
+    </div>
+    <div class="typing-progress"></div>
+  `;
+
+  div.appendChild(avatar);
+  div.appendChild(bubble);
+  chatMessages.appendChild(div);
+  scrollToBottom();
+
+  typingStart = Date.now();
+  typingTimer = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - typingStart) / 1000);
+    const statusEl = document.getElementById('typingStatusText');
+    if (statusEl) {
+      let msg = STATUS_MESSAGES[0].text;
+      for (const s of STATUS_MESSAGES) if (elapsed >= s.after) msg = s.text;
+      statusEl.textContent = msg;
+    }
+    scrollToBottom();
+  }, 1000);
+}
+
+function hideTyping() {
+  if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+  const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
+}
+
+// === Send / API ===
+async function sendMessage() {
+  const text = chatInput.value.trim();
+  if (!text || isWaiting) return;
+
+  // First message of a brand-new chat: lock in the starting ePlant
+  if (activeChatId == null && messageCount === 0) {
+    chatStartEplant = currentEplant;
+    eplantWarn.classList.remove('show');
+  }
+
+  isWaiting = true;
+  sendBtn.disabled = true;
+  chatInput.value = '';
+  chatInput.style.height = 'auto';
+
+  let displayText = text;
+  if (pendingAttachments.length > 0) {
+    const names = pendingAttachments.map(a => a.original_name || a.name).join(', ');
+    displayText += '\n\n📎 ' + names;
+  }
+  addMessage('user', displayText);
+  showTyping();
+
+  const atts = [...pendingAttachments];
+  pendingAttachments = [];
+  attachmentsBar.innerHTML = '';
+
+  try {
+    const body = { question: text, attachments: atts };
+    if (activeChatId != null) body.chat_id = activeChatId;
+    const resp = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    hideTyping();
+    addMessage('assistant', data.answer || data.error || 'No response.', null, data.report_url);
+
+    // Capture chat_id from backend; refresh sidebar
+    if (data.chat_id != null && String(data.chat_id) !== String(activeChatId)) {
+      activeChatId = data.chat_id;
+    }
+    if (data.chat_id != null) {
+      loadChatList(); // fire & forget
+    }
+  } catch (err) {
+    hideTyping();
+    addMessage('assistant', 'Connection error. Please try again.');
+  }
+
+  isWaiting = false;
+  sendBtn.disabled = false;
+  chatInput.focus();
+}
+
+async function exportMessage(btn, content, fmt) {
+  btn.classList.add('exporting');
+  const origText = btn.innerHTML;
+  btn.innerHTML = origText.replace(/(PDF|Word|Excel)/, '$1...');
+  try {
+    const resp = await fetch('/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: content, format: fmt }),
+    });
+    const data = await resp.json();
+    if (data.url) {
+      const a = document.createElement('a');
+      a.href = data.url; a.download = '';
+      document.body.appendChild(a); a.click(); a.remove();
+    } else {
+      alert('Export failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (e) {
+    alert('Export failed: connection error');
+  }
+  btn.classList.remove('exporting');
+  btn.innerHTML = origText;
+}
+
+// === Uploads ===
 fileInput.addEventListener('change', async () => {
   for (const file of fileInput.files) {
     const chip = addChip(file.name, true);
     const formData = new FormData();
     formData.append('file', file);
-
     try {
       const resp = await fetch('/upload', { method: 'POST', body: formData });
       const data = await resp.json();
@@ -336,7 +985,7 @@ function addChip(name, uploading) {
   const chip = document.createElement('div');
   chip.className = 'attachment-chip' + (uploading ? ' uploading' : '');
   chip.dataset.id = id;
-  chip.innerHTML = `<span class="chip-name" title="${name}">${name}</span><span class="chip-remove" onclick="removeAttachment('${id}')">&times;</span>`;
+  chip.innerHTML = `<span class="chip-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span><span class="chip-remove" onclick="removeAttachment('${id}')">&times;</span>`;
   attachmentsBar.appendChild(chip);
   return chip;
 }
@@ -347,265 +996,85 @@ function removeAttachment(chipId) {
   pendingAttachments = pendingAttachments.filter(a => a._chipId !== chipId);
 }
 
-// ePlant switcher
+// === ePlant ===
+function setEplantUI(id, silent) {
+  if (!EPLANTS[id]) return;
+  currentEplant = id;
+  eplantSelect.value = id;
+  eplantBadgeName.textContent = EPLANTS[id].name;
+  eplantBadge.className = 'eplant-active eplant-' + id;
+  if (!silent) {
+    const status = document.getElementById('eplantStatus');
+    status.textContent = 'Queries now filtered to ' + EPLANTS[id].name;
+    setTimeout(() => status.textContent = '', 3000);
+  }
+}
+
 async function changeEplant(id) {
   const status = document.getElementById('eplantStatus');
   status.textContent = 'Switching...';
   try {
     const resp = await fetch('/set-eplant', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({eplant_id: id}),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ eplant_id: id }),
     });
     const data = await resp.json();
     if (data.ok) {
-      status.textContent = 'Queries now filtered to ' + data.name;
-      setTimeout(() => status.textContent = '', 3000);
+      setEplantUI(id);
+      // mid-conversation warning
+      if (activeChatId != null && messageCount > 0 && id !== chatStartEplant) {
+        eplantWarn.classList.add('show');
+      } else {
+        eplantWarn.classList.remove('show');
+      }
+    } else {
+      status.textContent = 'Failed to switch';
     }
   } catch (e) {
     status.textContent = 'Failed to switch';
   }
 }
 
-// Auto-resize textarea
+// === Mobile sidebar ===
+function toggleSidebar(force) {
+  const willOpen = typeof force === 'boolean' ? force : !sidebar.classList.contains('open');
+  sidebar.classList.toggle('open', willOpen);
+  sidebarBackdrop.classList.toggle('open', willOpen);
+}
+function closeMobileSidebar() {
+  if (window.matchMedia('(max-width: 768px)').matches) toggleSidebar(false);
+}
+
+// === Input wiring ===
 chatInput.addEventListener('input', () => {
   chatInput.style.height = 'auto';
   chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + 'px';
 });
-
-// Enter to send (Shift+Enter for newline)
 chatInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
   }
 });
-
 function useExample(btn) {
-  chatInput.value = btn.textContent;
+  // get text without the icon span
+  const span = btn.querySelector('.ex-icon');
+  const txt = btn.textContent.replace(span ? span.textContent : '', '').trim();
+  chatInput.value = txt;
   chatInput.focus();
 }
 
-function scrollToBottom() {
-  chatMessages.scrollTop = chatMessages.scrollHeight;
-}
-
-function addMessage(role, content, time, reportUrl) {
-  // Remove welcome screen
-  const welcome = document.getElementById('welcome');
-  if (welcome) welcome.remove();
-
-  const div = document.createElement('div');
-  div.className = `msg msg-${role}`;
-
-  const avatar = document.createElement('div');
-  avatar.className = 'msg-avatar';
-  avatar.textContent = role === 'user' ? 'You' : 'AI';
-
-  const inner = document.createElement('div');
-  const bubble = document.createElement('div');
-  bubble.className = 'msg-bubble';
-
-  if (role === 'assistant') {
-    bubble.innerHTML = marked.parse(content);
+// === Bootstrap ===
+(function init() {
+  // Server-rendered messages from {% raw %}{{ messages }}{% endraw %} (legacy fallback)
+  const initial = {{ messages|tojson if messages else '[]' }};
+  if (Array.isArray(initial) && initial.length) {
+    initial.forEach(m => addMessage(m.role, m.content, m.timestamp, m.report_url, true));
   } else {
-    bubble.textContent = content;
+    renderWelcome();
   }
-
-  inner.appendChild(bubble);
-
-  // Add download button if report is available
-  if (reportUrl) {
-    const dl = document.createElement('a');
-    dl.className = 'report-download';
-    dl.href = reportUrl;
-    dl.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-    </svg> Download Report`;
-    inner.appendChild(dl);
-  }
-
-  // Add export buttons on AI responses
-  if (role === 'assistant' && content && !content.startsWith('Sorry') && !content.startsWith('Connection error')) {
-    const exportBar = document.createElement('div');
-    exportBar.className = 'export-bar';
-    const msgId = Math.random().toString(36).slice(2, 10);
-    // Store raw markdown for export
-    div.dataset.rawContent = content;
-
-    const formats = [
-      { fmt: 'pdf',  label: 'PDF',   icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' },
-      { fmt: 'docx', label: 'Word',  icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>' },
-      { fmt: 'xlsx', label: 'Excel', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>' },
-    ];
-
-    formats.forEach(({fmt, label, icon}) => {
-      const btn = document.createElement('button');
-      btn.className = 'export-btn';
-      btn.innerHTML = `${icon} ${label}`;
-      btn.onclick = () => exportMessage(btn, content, fmt);
-      exportBar.appendChild(btn);
-    });
-
-    inner.appendChild(exportBar);
-  }
-
-  const timeEl = document.createElement('div');
-  timeEl.className = 'msg-time';
-  timeEl.textContent = time || new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-
-  inner.appendChild(timeEl);
-  div.appendChild(avatar);
-  div.appendChild(inner);
-  chatMessages.appendChild(div);
-  scrollToBottom();
-}
-
-let typingTimer = null;
-let typingStart = 0;
-
-const STATUS_MESSAGES = [
-  { after: 0,  text: 'Connecting to database...' },
-  { after: 5,  text: 'Running queries...' },
-  { after: 15, text: 'Analyzing data...' },
-  { after: 30, text: 'Still working — complex queries take a bit longer...' },
-  { after: 60, text: 'Crunching numbers across multiple tables...' },
-  { after: 90, text: 'Almost there — pulling together the results...' },
-  { after: 150, text: 'This is a big one — hang tight...' },
-  { after: 240, text: 'Wrapping up...' },
-];
-
-function showTyping() {
-  const div = document.createElement('div');
-  div.className = 'typing-indicator';
-  div.id = 'typingIndicator';
-
-  const avatar = document.createElement('div');
-  avatar.className = 'msg-avatar';
-  avatar.style.background = 'var(--navy)';
-  avatar.style.border = '1px solid var(--border)';
-  avatar.textContent = 'AI';
-
-  const bubble = document.createElement('div');
-  bubble.className = 'typing-bubble';
-  bubble.innerHTML = `
-    <div class="typing-dots-row"><span></span><span></span><span></span></div>
-    <div class="typing-status">
-      <span id="typingStatusText">Connecting to database...</span>
-      <span class="typing-timer" id="typingTimerText">0s</span>
-    </div>
-  `;
-
-  div.appendChild(avatar);
-  div.appendChild(bubble);
-  chatMessages.appendChild(div);
-  scrollToBottom();
-
-  typingStart = Date.now();
-  typingTimer = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - typingStart) / 1000);
-    const timerEl = document.getElementById('typingTimerText');
-    const statusEl = document.getElementById('typingStatusText');
-    if (timerEl) {
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      timerEl.textContent = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-    }
-    if (statusEl) {
-      let msg = STATUS_MESSAGES[0].text;
-      for (const s of STATUS_MESSAGES) {
-        if (elapsed >= s.after) msg = s.text;
-      }
-      statusEl.textContent = msg;
-    }
-    scrollToBottom();
-  }, 1000);
-}
-
-function hideTyping() {
-  if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
-  const el = document.getElementById('typingIndicator');
-  if (el) el.remove();
-}
-
-async function sendMessage() {
-  const text = chatInput.value.trim();
-  if (!text || isWaiting) return;
-
-  isWaiting = true;
-  sendBtn.disabled = true;
-  chatInput.value = '';
-  chatInput.style.height = 'auto';
-
-  // Build display text with attachment names
-  let displayText = text;
-  if (pendingAttachments.length > 0) {
-    const names = pendingAttachments.map(a => a.original_name || a.name).join(', ');
-    displayText += '\n\n\ud83d\udcce ' + names;
-  }
-  addMessage('user', displayText);
-  showTyping();
-
-  // Copy and clear attachments
-  const atts = [...pendingAttachments];
-  pendingAttachments = [];
-  attachmentsBar.innerHTML = '';
-
-  try {
-    const resp = await fetch('/ask', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: text, attachments: atts}),
-    });
-    const data = await resp.json();
-    hideTyping();
-    addMessage('assistant', data.answer || data.error || 'No response.', null, data.report_url);
-  } catch (err) {
-    hideTyping();
-    addMessage('assistant', 'Connection error. Please try again.');
-  }
-
-  isWaiting = false;
-  sendBtn.disabled = false;
-  chatInput.focus();
-}
-
-async function exportMessage(btn, content, fmt) {
-  btn.classList.add('exporting');
-  const origText = btn.innerHTML;
-  btn.innerHTML = origText.replace(/(PDF|Word|Excel)/, '$1...');
-
-  try {
-    const resp = await fetch('/export', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({content: content, format: fmt}),
-    });
-    const data = await resp.json();
-    if (data.url) {
-      // Trigger download
-      const a = document.createElement('a');
-      a.href = data.url;
-      a.download = '';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    } else {
-      alert('Export failed: ' + (data.error || 'Unknown error'));
-    }
-  } catch (e) {
-    alert('Export failed: connection error');
-  }
-
-  btn.classList.remove('exporting');
-  btn.innerHTML = origText;
-}
-
-// Re-render existing messages with markdown
-document.querySelectorAll('.msg-assistant .msg-bubble').forEach(el => {
-  el.innerHTML = marked.parse(el.textContent);
-});
-
-scrollToBottom();
+  loadChatList();
+})();
 </script>
 {% endblock %}

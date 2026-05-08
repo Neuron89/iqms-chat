@@ -3,6 +3,8 @@ __pycache__/
 .env
 data/users.json
 data/mcp_config*.json
+data/*.db
 uploads/
 reports/
 *.log
+.pytest_cache/
