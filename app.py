@@ -32,6 +32,7 @@ from flask import (
 )
 
 import db  # SQLite persistence (auto-inits schema on import)
+import iqms_lookup  # IQMS Oracle permissions lookup (Phase 2)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
@@ -308,6 +309,137 @@ or anything SCADA/historian related, use the dataPARC tools. You can combine IQM
 data in a single answer when relevant (e.g. correlating production records with process parameters).
 """
 
+# ---------------------------------------------------------------------------
+# Access control — Layer A (system-prompt enforcement)
+# ---------------------------------------------------------------------------
+
+# Forbidden modules we explicitly call out by name when a user's allowed list
+# doesn't cover them. Helps the model refuse cleanly instead of guessing.
+SENSITIVE_MODULES = (
+    "Payroll / Time & Attendance (PR_*, DAY_*EMP*, DAY_HRS, DAY_LABOR_PROJECT)",
+    "General Ledger (GL%, GLACCT, FRL_ACCT_*)",
+    "Accounts Payable / Vendor financials (AP%, VEND%, PO%)",
+    "Accounts Receivable / Customer credit (ARCUSTO, AR%, AKA%)",
+    "HR (EMP_*, S_USER_GENERAL, S_USERS)",
+    "System administration (EDI_*, IQALERT*, S_SYS*)",
+)
+
+
+def _build_access_control_block(packet: dict | None, *, display_name: str, email: str) -> str:
+    """
+    Build the access-control section that gets injected into the USER prompt
+    (so the system prompt stays user-agnostic and cache-friendly).
+
+    Returns "" for super-admin or empty packet (super-admin gets no
+    restrictions; an empty packet means "no IQMS access" — the system prompt
+    handles that case implicitly because no allowed prefixes => Layer B blocks
+    everything anyway, but we still emit a clear refusal message).
+    """
+    if packet is None:
+        return ""
+    module_prefixes = packet.get("module_prefixes") or []
+    if module_prefixes == ["*"]:
+        return ""  # Super-admin / IQALL — no Layer A restrictions
+
+    allowed_table_prefixes = packet.get("allowed_table_prefixes") or []
+    tier = packet.get("tier") or "viewer"
+
+    if not module_prefixes:
+        # Authenticated portal user but no IQMS access at all.
+        return (
+            "=== Access control ===\n"
+            f"You are answering on behalf of: {display_name} ({email})\n"
+            "Tier: no IQMS access\n"
+            "This user has no IQMS roles assigned. You MUST refuse any request\n"
+            "that would query the IQMS database. Respond with:\n"
+            "\"I'm sorry — your account does not have access to IQMS data.\n"
+            " Contact your admin to request access.\"\n"
+            "Do not attempt the query. The MCP allowlist will also block it server-side.\n"
+            "=== End access control ===\n"
+        )
+
+    modules_joined = ", ".join(module_prefixes)
+    tables_joined = ", ".join(allowed_table_prefixes)
+    forbidden_joined = "; ".join(SENSITIVE_MODULES)
+
+    return (
+        "=== Access control ===\n"
+        f"You are answering on behalf of: {display_name} ({email})\n"
+        f"Tier: {tier}\n"
+        f"Allowed IQMS module prefixes: {modules_joined}\n"
+        f"Allowed table name patterns: {tables_joined}\n\n"
+        "You MUST refuse any query that would read from a table not matching\n"
+        "one of the allowed patterns above. Specifically, the following modules\n"
+        "are FORBIDDEN for this user unless explicitly listed above:\n"
+        f"  {forbidden_joined}\n\n"
+        "If the user asks for data you cannot provide, respond with:\n"
+        "\"I'm sorry — your account does not have access to {module} data in\n"
+        " IQMS. Contact your admin to request access.\"\n"
+        "Do not attempt the query. Do not list every denied table back to the\n"
+        "user; just refuse the specific request and name the module.\n\n"
+        "The MCP allowlist (Layer B) will also block these queries server-side,\n"
+        "so even if you attempt them they will fail. Refuse cleanly and inform\n"
+        "the user.\n"
+        "=== End access control ===\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-request MCP config — writes the user's allowed_table_prefixes into the
+# iqms-oracle MCP env so Agent B (Layer B) can filter server-side.
+# ---------------------------------------------------------------------------
+
+MCP_TMP_DIR = DATA_DIR / "tmp"
+MCP_TMP_DIR.mkdir(exist_ok=True)
+
+
+def _build_mcp_config(packet: dict | None, *, is_nycoa: bool, chat_id: str) -> Path:
+    """
+    Write a per-request MCP config JSON with the user's allowed_table_prefixes
+    embedded. Returns the path; caller is responsible for cleaning up.
+
+    Contract for the iqms-oracle MCP (Agent B):
+      mcpServers.iqms-oracle.env.IQMS_ALLOWED_TABLE_PREFIXES = JSON-encoded list
+      mcpServers.iqms-oracle.allowedTablePrefixes = same list (config-level
+        mirror so the MCP can read either env or config — picks whichever is
+        present, prefers config-level).
+      ['%'] or empty/missing  → no filtering (default).
+    """
+    allowed = (packet or {}).get("allowed_table_prefixes") or []
+    # ['*'] is super-admin shorthand; flatten to ['%'] for the MCP (which uses
+    # SQL LIKE semantics).
+    if allowed == ["*"]:
+        allowed = ["%"]
+
+    iqms_env = dict(IQMS_MCP["env"])
+    if allowed and allowed != ["%"]:
+        # Comma-separated string (env-friendly). Agent B parses this in the
+        # iqms-oracle MCP server. Whitespace around commas is tolerated.
+        iqms_env["IQMS_ALLOWED_TABLE_PREFIXES"] = ",".join(allowed)
+
+    iqms_block = {
+        "command": IQMS_MCP["command"],
+        "args": list(IQMS_MCP["args"]),
+        "env": iqms_env,
+    }
+    if allowed and allowed != ["%"]:
+        # Config-level mirror (JSON array form) — Agent B will read this
+        # preferentially when present, falling back to the env var.
+        iqms_block["allowedTablePrefixes"] = allowed
+
+    servers = {"iqms-oracle": iqms_block}
+    if is_nycoa:
+        servers["dataparc"] = {
+            "command": DATAPARC_MCP["command"],
+            "args": list(DATAPARC_MCP["args"]),
+            "env": dict(DATAPARC_MCP["env"]),
+        }
+
+    config_path = MCP_TMP_DIR / f"mcp_{chat_id[:8]}_{uuid.uuid4().hex[:6]}.json"
+    config_path.write_text(json.dumps({"mcpServers": servers}, indent=2))
+    return config_path
+
+
 # Store conversation histories in memory (keyed by session chat_id).
 # Kept for legacy view-state on the chat page; the source of truth is now SQLite (db.py).
 conversations: dict[str, list] = {}
@@ -425,9 +557,9 @@ def admin_required(f):
     def decorated(*args, **kwargs):
         if "username" not in session:
             return redirect(url_for("login"))
-        users = _load_users()
-        user = users.get(session["username"], {})
-        if not user.get("is_admin"):
+        # Trust the flag set on the session at login time. The session itself
+        # is signed, and login flows refresh it from the DB on every entry.
+        if not session.get("is_admin"):
             flash("Admin access required.", "error")
             return redirect(url_for("chat"))
         return f(*args, **kwargs)
@@ -436,37 +568,131 @@ def admin_required(f):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    """
+    Local password login — break-glass path for the legacy `admin` account
+    when SSO is unavailable. SSO users have NULL pw_hash and cannot log in
+    via this form. Source of truth is the SQLite `users` table; we still
+    consult `users.json` for read-through compatibility during rollout.
+    """
     if request.method == "POST":
         username = request.form.get("username", "").strip().lower()
         password = request.form.get("password", "")
 
-        users = _load_users()
-        if username not in users:
-            flash("Invalid credentials.", "error")
-            return render_template("login.html")
+        # Prefer the SQLite users table; fall back to the JSON file.
+        u_row = db.get_user(username)
+        if u_row and u_row.get("pw_hash") and u_row.get("pw_salt"):
+            if u_row["pw_hash"] != _hash_pw(password, u_row["pw_salt"]):
+                flash("Invalid credentials.", "error")
+                return render_template("login.html")
+            if not u_row.get("active", 1):
+                flash("Account disabled — contact admin.", "error")
+                return render_template("login.html")
+            display_name = u_row.get("display_name") or username
+            is_admin = bool(u_row.get("is_super_admin"))
+        else:
+            users = _load_users()
+            if username not in users:
+                flash("Invalid credentials.", "error")
+                return render_template("login.html")
+            if users[username]["hash"] != _hash_pw(password, users[username]["salt"]):
+                flash("Invalid credentials.", "error")
+                return render_template("login.html")
+            display_name = users[username].get("display_name", username)
+            is_admin = users[username].get("is_admin", False)
 
-        if users[username]["hash"] != _hash_pw(password, users[username]["salt"]):
-            flash("Invalid credentials.", "error")
-            return render_template("login.html")
-
+        # Pull cached IQMS packet if any (legacy admin won't have one — that's
+        # fine; super-admins bypass the access-control prompt anyway).
+        packet = db.get_iqms_permissions(username)
         session["username"] = username
-        session["display_name"] = users[username].get("display_name", username)
-        session["is_admin"] = users[username].get("is_admin", False)
+        session["display_name"] = display_name
+        session["is_admin"] = is_admin
         session["chat_id"] = str(uuid.uuid4())
         session["eplant_id"] = "2"  # Default to Nycoa
+        if packet:
+            session["permission_packet"] = {
+                k: packet.get(k) for k in (
+                    "iqms_user_name", "email", "role_names",
+                    "module_prefixes", "allowed_table_prefixes",
+                    "eplant_ids", "tier", "synced_at",
+                )
+            }
+            session["eplant_access"] = packet.get("eplant_ids") or [1, 2, 3]
+        else:
+            # Local admin — full access, no packet.
+            session["permission_packet"] = None
+            session["eplant_access"] = [1, 2, 3]
+        db.touch_last_login(username)
         log_info(f"User '{username}' logged in")
         return redirect(url_for("chat"))
 
     return render_template("login.html")
 
 
+SUPER_ADMIN_EMAILS = {"hnester@nycoa.com"}
+
+
+def _empty_permission_packet(email: str) -> dict:
+    """Returned for users in the portal but absent from IQMS."""
+    return {
+        "iqms_user_name": None,
+        "email": email,
+        "role_names": [],
+        "module_prefixes": [],
+        "allowed_table_prefixes": [],
+        "eplant_ids": [],
+        "tier": "viewer",
+        "synced_at": iqms_lookup.now_iso(),
+    }
+
+
+def _super_admin_packet(email: str, base: dict | None) -> dict:
+    """
+    Hardcoded full-access packet. Used for hnester@nycoa.com regardless of
+    whether the IQMS lookup succeeded — guarantees Hayden never gets locked
+    out by a transient Oracle outage or a renamed IQMS account.
+    """
+    base_roles = list((base or {}).get("role_names") or [])
+    for r in ("IQALL", "SUPER_ADMIN"):
+        if r not in base_roles:
+            base_roles.append(r)
+    return {
+        "iqms_user_name": (base or {}).get("iqms_user_name") or email.split("@")[0].upper(),
+        "email": email,
+        "role_names": base_roles,
+        "module_prefixes": ["*"],
+        "allowed_table_prefixes": ["%"],
+        "eplant_ids": (base or {}).get("eplant_ids") or [1, 2, 3],
+        "tier": "admin",
+        "synced_at": iqms_lookup.now_iso(),
+    }
+
+
+def _resolve_permission_packet(email: str, *, is_super: bool) -> dict:
+    """
+    Pull the permission packet for `email`, applying the super-admin override
+    and the "no IQMS account" fallback. Always returns a packet — never None.
+    """
+    try:
+        packet = iqms_lookup.fetch_permissions_for_email(email)
+    except Exception as exc:  # defensive — iqms_lookup catches its own errors
+        log_warn(f"IQMS lookup raised unexpectedly for {email}: {exc}")
+        packet = None
+
+    if is_super:
+        return _super_admin_packet(email, packet)
+    if not packet:
+        return _empty_permission_packet(email)
+    return packet
+
+
 @app.route("/sso")
 def sso():
     """
-    NYCOA Portal SSO landing. Verifies the portal-issued JWT, then logs the
-    visitor in as the hardcoded `admin` user (single-user setup for now;
-    real per-user accounts will replace this once IQMS chat gets its own
-    user store wired to the directory).
+    NYCOA Portal SSO landing. Verifies the portal JWT, looks up the user's
+    IQMS roles via iqms_lookup, upserts users + iqms_permissions, and writes
+    the per-session permission packet for the prompt builder + MCP allowlist.
+
+    See docs/permissions-design.md for the full flow.
     """
     ptoken = request.args.get("ptoken", "")
     next_path = request.args.get("next", "/")
@@ -493,20 +719,50 @@ def sso():
         flash("Invalid or expired SSO token. Click the IQMS Chat tile in the portal again.", "error")
         return redirect(url_for("login"))
 
-    users = _load_users()
-    if "admin" not in users:
-        log_error("admin user missing from users.json — cannot complete SSO")
-        flash("Admin account not configured.", "error")
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        log_error("Portal SSO token missing 'email' claim")
+        flash("SSO failed: no email in token.", "error")
         return redirect(url_for("login"))
 
-    admin_user = users["admin"]
-    session["username"] = "admin"
-    session["display_name"] = claims.get("full_name") or admin_user.get("display_name", "admin")
-    session["is_admin"] = bool(admin_user.get("is_admin"))
+    full_name = claims.get("full_name") or email
+    is_super = email in SUPER_ADMIN_EMAILS
+
+    packet = _resolve_permission_packet(email, is_super=is_super)
+
+    # Upsert the user row first so the permissions FK has somewhere to land.
+    db.upsert_user(
+        username=email,
+        email=email,
+        display_name=full_name,
+        is_super_admin=is_super,
+    )
+    db.upsert_iqms_permissions(email, packet)
+
+    # Active check (admin can deactivate via the admin UI).
+    user_row = db.get_user(email)
+    if user_row is None or not user_row.get("active", 1):
+        flash("Account disabled — contact admin.", "error")
+        return redirect(url_for("login"))
+
+    db.touch_last_login(email)
+
+    eplant_access = packet.get("eplant_ids") or [1, 2, 3]
+    default_eplant = eplant_access[0] if eplant_access else 2
+
+    session.clear()
+    session["username"] = email
+    session["display_name"] = full_name
+    session["is_admin"] = is_super or "IQALL" in (packet.get("role_names") or [])
+    session["eplant_id"] = str(default_eplant)
+    session["eplant_access"] = eplant_access
+    session["permission_packet"] = packet
     session["chat_id"] = str(uuid.uuid4())
-    session["eplant_id"] = "2"  # Default to Nycoa
-    session["sso_email"] = claims.get("email", "")
-    log_info(f"Portal SSO sign-in for {claims.get('email','?')} → admin")
+    session["sso_email"] = email
+    log_info(
+        f"Portal SSO sign-in for {email} (tier={packet['tier']}, "
+        f"roles={len(packet.get('role_names') or [])})"
+    )
 
     if not next_path.startswith("/"):
         next_path = "/"
@@ -753,8 +1009,20 @@ def ask():
     prior_msgs = all_msgs[:-1] if all_msgs else []
     prior_context = _format_prior_context(prior_msgs)
 
-    # Build the full prompt: prior context (if any) + current question + attachments.
+    # Layer A access control — user-prompt injection (system prompt stays
+    # user-agnostic + cacheable). Empty for super-admin / IQALL.
+    packet = session.get("permission_packet")
+    access_control_block = _build_access_control_block(
+        packet,
+        display_name=session.get("display_name", username),
+        email=session.get("sso_email") or username,
+    )
+
+    # Build the full prompt: access control + prior context (if any) +
+    # current question + attachments.
     parts: list[str] = []
+    if access_control_block:
+        parts.append(access_control_block)
     if prior_context:
         parts.append(prior_context)
         parts.append("=== Current Question ===")
@@ -781,7 +1049,18 @@ def ask():
     # dataPARC only available for Nycoa (eplant 2)
     is_nycoa = eplant_id_str == "2"
     dataparc_section = DATAPARC_PROMPT_SECTION if is_nycoa else ""
-    mcp_config_file = str(MCP_CONFIG_ALL) if is_nycoa else str(MCP_CONFIG_IQMS)
+
+    # Build a per-request MCP config that injects the user's allowed table
+    # prefixes into the iqms-oracle MCP (Agent B reads them as IQMS_ALLOWED_
+    # TABLE_PREFIXES + config.allowedTablePrefixes). For super-admins this
+    # degrades to ['%'] — no filtering — matching the existing static configs.
+    try:
+        mcp_config_path = _build_mcp_config(packet, is_nycoa=is_nycoa, chat_id=chat_id)
+        mcp_config_file = str(mcp_config_path)
+    except Exception as exc:
+        log_warn(f"Failed to build per-request MCP config ({exc}); falling back to static")
+        mcp_config_path = None
+        mcp_config_file = str(MCP_CONFIG_ALL) if is_nycoa else str(MCP_CONFIG_IQMS)
 
     # Load fresh agent memory for each query
     agent_memory = _load_core_memory()
@@ -876,6 +1155,12 @@ def ask():
         prompt_file.unlink(missing_ok=True)
     except Exception:
         pass
+    # Clean up per-request MCP config (if we wrote one)
+    if mcp_config_path is not None:
+        try:
+            mcp_config_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     # Check for report in the answer
     answer, report_url = _extract_report(answer, username)
@@ -1242,10 +1527,16 @@ def export():
 @admin_required
 def admin():
     users = _load_users()
+    try:
+        sso_users = db.list_users()
+    except Exception as exc:
+        log_warn(f"admin: failed to list SSO users ({exc})")
+        sso_users = []
     return render_template("admin.html",
                            username=session["username"],
                            display_name=session.get("display_name", session["username"]),
-                           users=users)
+                           users=users,
+                           sso_users=sso_users)
 
 
 @app.route("/admin/add-user", methods=["POST"])
@@ -1323,6 +1614,108 @@ def reset_password():
 
 
 # ---------------------------------------------------------------------------
+# Admin — SSO user management (Phase 2)
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@admin_required
+def admin_users():
+    """
+    GET  → JSON list of SSO users (the HTML view lives at /admin).
+    POST → pre-create / invite a user. Body: {email, display_name?,
+           is_super_admin?}. Idempotent — re-creating an existing user is a
+           200 with the existing row.
+    """
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            return jsonify({"error": "email is required"}), 400
+        display_name = data.get("display_name") or email
+        is_super = bool(data.get("is_super_admin")) or email in SUPER_ADMIN_EMAILS
+        existing = db.get_user(email)
+        row = db.upsert_user(
+            username=email,
+            email=email,
+            display_name=display_name,
+            is_super_admin=is_super,
+        )
+        log_info(
+            f"Admin {session['username']} {'updated' if existing else 'created'} "
+            f"user {email}"
+        )
+        return jsonify({"ok": True, "user": row}), (200 if existing else 201)
+
+    rows = db.list_users()
+    return jsonify(rows)
+
+
+@app.route("/admin/users/<username>", methods=["GET"])
+@admin_required
+def admin_user_detail(username):
+    """
+    Full detail view (JSON) for one SSO user. Top-level fields mirror the
+    user row; `permissions` carries the cached packet; `raw_packet` is a
+    convenience alias for the same JSON the admin UI's "raw packet" pane
+    displays.
+    """
+    user_row = db.get_user(username)
+    if user_row is None:
+        return jsonify({"error": "User not found"}), 404
+    packet = db.get_iqms_permissions(username) or {}
+    body = dict(user_row)
+    body["permissions"] = packet
+    body["raw_packet"] = packet.get("raw_packet") if packet else None
+    # Also keep the older nested shape for compat
+    body["user"] = user_row
+    return jsonify(body)
+
+
+@app.route("/admin/users/<username>/active", methods=["POST"])
+@admin_required
+def admin_user_set_active(username):
+    """Toggle active/inactive on an SSO user. Body: {active: bool}."""
+    user_row = db.get_user(username)
+    if user_row is None:
+        return jsonify({"error": "User not found"}), 404
+    if username == session["username"]:
+        return jsonify({"error": "You can't deactivate yourself."}), 400
+    data = request.get_json(silent=True) or {}
+    if "active" not in data:
+        return jsonify({"error": "active flag required"}), 400
+    active = bool(data["active"])
+    if not db.set_user_active(username, active):
+        return jsonify({"error": "User not found"}), 404
+    log_info(
+        f"Admin {session['username']} set active={active} on {username}",
+    )
+    return jsonify({"ok": True, "active": active})
+
+
+@app.route("/admin/users/<username>/refresh", methods=["POST"])
+@admin_required
+def admin_user_refresh(username):
+    """
+    Re-pull the IQMS permission packet for a user from Oracle and persist it.
+    Useful when an admin grants the user a new IQMS role and wants the chat
+    to pick it up without waiting for the next login.
+    """
+    user_row = db.get_user(username)
+    if user_row is None:
+        return jsonify({"error": "User not found"}), 404
+
+    email = (user_row.get("email") or username).lower()
+    is_super = email in SUPER_ADMIN_EMAILS or bool(user_row.get("is_super_admin"))
+    packet = _resolve_permission_packet(email, is_super=is_super)
+    db.upsert_iqms_permissions(username, packet)
+    log_info(
+        f"Admin {session['username']} refreshed IQMS perms for {username} "
+        f"(roles={len(packet.get('role_names') or [])}, tier={packet.get('tier')})"
+    )
+    return jsonify({"ok": True, "packet": packet})
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap admin if no users exist
 # ---------------------------------------------------------------------------
 def _ensure_admin():
@@ -1341,9 +1734,47 @@ def _ensure_admin():
         print(">>> Change the password immediately via the admin panel!")
 
 
+def _migrate_users_json(users_json_path: Path | None = None,
+                        db_path: Path | None = None) -> dict:
+    """
+    Idempotent migration of data/users.json into the SQLite users table.
+    Safe to run on every app boot; existing rows are skipped. Returns the
+    migration summary {migrated, skipped, missing}. Tests call this directly.
+    """
+    from scripts.migrate_users_json import migrate as _migrate
+    target = users_json_path if users_json_path is not None else USERS_FILE
+    result = _migrate(users_json_path=target, db_path=db_path)
+    if result.get("migrated"):
+        log_info(
+            f"Migrated {result['migrated']} legacy user(s) from users.json "
+            f"into SQLite (skipped {result.get('skipped', 0)})"
+        )
+    return result
+
+
+# Public alias matching the names Agent C's tests look for
+migrate_users_json = _migrate_users_json
+
+
+def _migrate_users_json_once():
+    """Run the migration but never raise (called on every app boot)."""
+    try:
+        _migrate_users_json()
+    except Exception as exc:
+        log_warn(f"users.json → SQLite migration failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     _ensure_admin()
+    _migrate_users_json_once()
     app.run(host="0.0.0.0", port=5055, debug=False)
+else:
+    # Imported (gunicorn / tests / `python -c "import app"`) — still run the
+    # migration once so the SQLite table is in sync. Idempotent.
+    try:
+        _migrate_users_json_once()
+    except Exception:
+        pass

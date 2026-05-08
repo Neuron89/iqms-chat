@@ -40,6 +40,33 @@ CREATE TABLE IF NOT EXISTS messages (
   timestamp TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, turn);
+
+-- Phase 2: SSO user store (replaces data/users.json long-term).
+CREATE TABLE IF NOT EXISTS users (
+  username       TEXT PRIMARY KEY,
+  email          TEXT UNIQUE,
+  display_name   TEXT NOT NULL,
+  active         INTEGER NOT NULL DEFAULT 1,
+  is_super_admin INTEGER NOT NULL DEFAULT 0,
+  pw_hash        TEXT,
+  pw_salt        TEXT,
+  created_at     TEXT NOT NULL,
+  last_login     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+-- Phase 2: cached IQMS permission packet per user. One-to-one with users.
+CREATE TABLE IF NOT EXISTS iqms_permissions (
+  username                TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+  iqms_user_name          TEXT,
+  role_names              TEXT NOT NULL,
+  module_prefixes         TEXT NOT NULL,
+  allowed_table_prefixes  TEXT NOT NULL,
+  eplant_ids              TEXT NOT NULL,
+  tier                    TEXT NOT NULL CHECK(tier IN ('viewer','operator','admin')),
+  synced_at               TEXT NOT NULL,
+  raw_packet              TEXT
+);
 """
 
 
@@ -260,6 +287,235 @@ def delete_chat(
             conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: users + iqms_permissions helpers
+# ---------------------------------------------------------------------------
+
+def upsert_user(
+    username: str,
+    email: Optional[str],
+    display_name: str,
+    is_super_admin: bool = False,
+    pw_hash: Optional[str] = None,
+    pw_salt: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> dict:
+    """
+    Create or update a user row. Idempotent — preserves `active` and `pw_hash`/
+    `pw_salt` on existing rows unless explicitly overridden by non-None values.
+    Returns the resulting row as a dict.
+    """
+    now = _now()
+    conn = _connect(db_path)
+    try:
+        existing = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO users (username, email, display_name, active, "
+                "is_super_admin, pw_hash, pw_salt, created_at, last_login) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?, NULL)",
+                (
+                    username, email, display_name,
+                    1 if is_super_admin else 0,
+                    pw_hash, pw_salt, now,
+                ),
+            )
+        else:
+            # Only update password fields when explicitly provided. Display
+            # name and email always refresh from latest claim.
+            new_hash = pw_hash if pw_hash is not None else existing["pw_hash"]
+            new_salt = pw_salt if pw_salt is not None else existing["pw_salt"]
+            conn.execute(
+                "UPDATE users SET email = ?, display_name = ?, "
+                "is_super_admin = ?, pw_hash = ?, pw_salt = ? "
+                "WHERE username = ?",
+                (
+                    email, display_name,
+                    1 if is_super_admin else 0,
+                    new_hash, new_salt, username,
+                ),
+            )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,),
+        ).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def get_user(username: str, db_path: Optional[Path] = None) -> Optional[dict]:
+    """Return the user row by username (PK), or None if not found."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def set_user_active(
+    username: str,
+    active: bool,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Toggle the active flag on a user. Returns True if a row was updated."""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE users SET active = ? WHERE username = ?",
+            (1 if active else 0, username),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def touch_last_login(username: str, db_path: Optional[Path] = None) -> None:
+    """Stamp last_login = now() for the given user. No-op if user missing."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE users SET last_login = ? WHERE username = ?",
+            (_now(), username),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_users(db_path: Optional[Path] = None) -> list[dict]:
+    """
+    Return all users with their IQMS permissions (left-joined). Decoded JSON
+    fields (`role_names`, `module_prefixes`, etc.) come back as Python lists.
+    """
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT u.username, u.email, u.display_name, u.active,
+                   u.is_super_admin, u.created_at, u.last_login,
+                   p.iqms_user_name, p.role_names, p.module_prefixes,
+                   p.allowed_table_prefixes, p.eplant_ids, p.tier,
+                   p.synced_at
+            FROM users u
+            LEFT JOIN iqms_permissions p ON p.username = u.username
+            ORDER BY u.created_at DESC
+            """,
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = _row_to_dict(r)
+            for jf in (
+                "role_names", "module_prefixes",
+                "allowed_table_prefixes", "eplant_ids",
+            ):
+                if d.get(jf):
+                    try:
+                        d[jf] = json.loads(d[jf])
+                    except (json.JSONDecodeError, TypeError):
+                        d[jf] = []
+                else:
+                    d[jf] = []
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def upsert_iqms_permissions(
+    username: str,
+    packet: dict,
+    db_path: Optional[Path] = None,
+) -> dict:
+    """
+    Persist an IQMS permission packet. `packet` shape (all keys required):
+      iqms_user_name (str|None), role_names (list[str]),
+      module_prefixes (list[str]), allowed_table_prefixes (list[str]),
+      eplant_ids (list[int]), tier ('viewer'|'operator'|'admin'),
+      synced_at (ISO str).
+    Optional: raw_packet (dict) — full original lookup for forensics.
+    """
+    role_names = json.dumps(packet.get("role_names") or [])
+    module_prefixes = json.dumps(packet.get("module_prefixes") or [])
+    allowed_table_prefixes = json.dumps(packet.get("allowed_table_prefixes") or [])
+    eplant_ids = json.dumps(packet.get("eplant_ids") or [])
+    tier = packet.get("tier") or "viewer"
+    if tier not in ("viewer", "operator", "admin"):
+        tier = "viewer"
+    raw = packet.get("raw_packet")
+    raw_json = json.dumps(raw) if raw is not None else json.dumps(packet)
+    synced_at = packet.get("synced_at") or _now()
+    iqms_user_name = packet.get("iqms_user_name")
+
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO iqms_permissions
+              (username, iqms_user_name, role_names, module_prefixes,
+               allowed_table_prefixes, eplant_ids, tier, synced_at, raw_packet)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+              iqms_user_name = excluded.iqms_user_name,
+              role_names = excluded.role_names,
+              module_prefixes = excluded.module_prefixes,
+              allowed_table_prefixes = excluded.allowed_table_prefixes,
+              eplant_ids = excluded.eplant_ids,
+              tier = excluded.tier,
+              synced_at = excluded.synced_at,
+              raw_packet = excluded.raw_packet
+            """,
+            (
+                username, iqms_user_name, role_names, module_prefixes,
+                allowed_table_prefixes, eplant_ids, tier, synced_at, raw_json,
+            ),
+        )
+        conn.commit()
+        return get_iqms_permissions(username, db_path=db_path) or {}
+    finally:
+        conn.close()
+
+
+def get_iqms_permissions(
+    username: str,
+    db_path: Optional[Path] = None,
+) -> Optional[dict]:
+    """Return the cached permission packet for a user, decoded into Python lists."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM iqms_permissions WHERE username = ?", (username,),
+        ).fetchone()
+        if row is None:
+            return None
+        d = _row_to_dict(row)
+        for jf in (
+            "role_names", "module_prefixes",
+            "allowed_table_prefixes", "eplant_ids",
+        ):
+            if d.get(jf):
+                try:
+                    d[jf] = json.loads(d[jf])
+                except (json.JSONDecodeError, TypeError):
+                    d[jf] = []
+            else:
+                d[jf] = []
+        if d.get("raw_packet"):
+            try:
+                d["raw_packet"] = json.loads(d["raw_packet"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return d
     finally:
         conn.close()
 

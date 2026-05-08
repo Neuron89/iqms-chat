@@ -2,22 +2,35 @@
 {% block title %}Admin — IQMS Chat{% endblock %}
 {% block head %}
 <style>
-  .admin-container { max-width: 700px; margin: 0 auto; padding: 1.5rem; }
+  .admin-container { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
   .card {
     background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
     padding: 1.5rem; margin-bottom: 1.5rem;
   }
   .card h3 { margin-bottom: 1rem; font-size: 1rem; color: var(--amber); }
-  .user-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  .card .card-subtitle {
+    color: var(--fg2); font-size: 0.8rem; margin-top: -0.6rem; margin-bottom: 1rem;
+  }
+  .user-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
   .user-table th {
-    text-align: left; padding: 0.5rem; font-size: 0.8rem; font-weight: 600;
+    text-align: left; padding: 0.5rem; font-size: 0.78rem; font-weight: 600;
     color: var(--fg2); text-transform: uppercase; border-bottom: 1px solid var(--border);
   }
-  .user-table td { padding: 0.5rem; border-bottom: 1px solid var(--bg3); }
+  .user-table td { padding: 0.55rem 0.5rem; border-bottom: 1px solid var(--bg3); vertical-align: top; }
   .user-table .badge {
     font-size: 0.7rem; padding: 0.15rem 0.4rem; border-radius: 3px;
     background: var(--amber-dim); color: var(--amber); font-weight: 600;
   }
+  .badge-tier {
+    display: inline-block; font-size: 0.7rem; padding: 0.15rem 0.45rem;
+    border-radius: 3px; font-weight: 600; text-transform: uppercase;
+  }
+  .badge-tier.admin    { background: #14532d; color: #86efac; }
+  .badge-tier.operator { background: #92400e; color: #fcd34d; }
+  .badge-tier.viewer   { background: #1e3a5f; color: #93c5fd; }
+  .badge-tier.none     { background: #7f1d1d; color: #fca5a5; }
+  .badge-active   { background: #14532d; color: #86efac; }
+  .badge-inactive { background: #7f1d1d; color: #fca5a5; }
   .inline-form { display: inline; }
   .form-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
   .form-row .form-group { flex: 1; min-width: 150px; }
@@ -26,6 +39,54 @@
     font-size: 0.85rem; color: var(--fg2);
   }
   .checkbox-group input[type="checkbox"] { accent-color: var(--amber); }
+  .roles-list {
+    color: var(--fg2); font-size: 0.78rem; max-width: 320px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .roles-list:hover { white-space: normal; }
+  .modules-list {
+    color: var(--fg); font-size: 0.78rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .toolbar {
+    display: flex; gap: 0.5rem; align-items: center;
+    margin-bottom: 1rem; flex-wrap: wrap;
+  }
+  .toolbar input[type="search"] {
+    flex: 1; min-width: 200px; padding: 0.45rem 0.7rem; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+    font-family: var(--font); font-size: 0.88rem; outline: none;
+  }
+  .toolbar input[type="search"]:focus { border-color: var(--amber); }
+  .row-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+  .modal-bg {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    z-index: 100; align-items: center; justify-content: center;
+  }
+  .modal-bg.show { display: flex; }
+  .modal {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    width: 90%; max-width: 720px; max-height: 80vh; overflow-y: auto;
+    padding: 1.5rem; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+  .modal h3 { margin: 0 0 0.5rem 0; color: var(--amber); }
+  .modal pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.8rem; font-size: 0.78rem; overflow-x: auto; max-height: 300px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .modal .modal-close {
+    float: right; background: var(--bg3); color: var(--fg);
+    border: none; padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer;
+    font-family: var(--font); font-size: 0.8rem;
+  }
+  details.collapsible {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 0.5rem 0.8rem; margin-top: 0.5rem;
+  }
+  details.collapsible summary {
+    cursor: pointer; font-weight: 600; color: var(--fg2); font-size: 0.85rem;
+  }
 </style>
 {% endblock %}
 
@@ -35,6 +96,7 @@
   <div class="nav-right">
     <span>{{ display_name }}</span>
     <a href="{{ url_for('chat') }}">Back to Chat</a>
+    <a href="{{ url_for('view_logs') }}">Logs</a>
     <a href="{{ url_for('logout') }}">Sign out</a>
   </div>
 </nav>
@@ -46,34 +108,118 @@
     {% endfor %}
   {% endwith %}
 
+  {# ------------------------------------------------------------------ #}
+  {# SSO Users (Phase 2) — primary user store, IQMS-permissions-driven  #}
+  {# ------------------------------------------------------------------ #}
   <div class="card">
-    <h3>Add User</h3>
-    <form method="POST" action="{{ url_for('add_user') }}">
-      <div class="form-row">
-        <div class="form-group">
-          <label>Username</label>
-          <input type="text" name="username" required autocomplete="off">
-        </div>
-        <div class="form-group">
-          <label>Display Name</label>
-          <input type="text" name="display_name" autocomplete="off">
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Password</label>
-        <input type="password" name="password" required autocomplete="new-password">
-      </div>
-      <div class="checkbox-group">
-        <input type="checkbox" name="is_admin" id="isAdmin">
-        <label for="isAdmin">Admin privileges</label>
-      </div>
-      <button type="submit" class="btn btn-primary" style="width:auto;">Add User</button>
-    </form>
+    <h3>SSO Users</h3>
+    <div class="card-subtitle">
+      Provisioned via NYCOA Portal SSO. Permissions sourced from IQMS roles
+      (refreshed at login; admin can force re-sync per user).
+    </div>
+
+    <div class="toolbar">
+      <input id="ssoFilter" type="search" placeholder="Filter by email / name / role…">
+    </div>
+
+    <table class="user-table" id="ssoUsersTable">
+      <thead>
+        <tr>
+          <th>Email</th>
+          <th>Name</th>
+          <th>Tier</th>
+          <th>Roles</th>
+          <th>Modules</th>
+          <th>Plants</th>
+          <th>Active</th>
+          <th>Last Login</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in (sso_users or []) %}
+        {% set tier = (u.tier or 'none')|lower %}
+        <tr data-username="{{ u.username }}"
+            data-search="{{ (u.email or '') }} {{ u.display_name or '' }} {{ ((u.role_names or [])|join(' '))|lower }}">
+          <td>{{ u.email or u.username }}{% if u.is_super_admin %} <span class="badge">SUPER</span>{% endif %}</td>
+          <td>{{ u.display_name }}</td>
+          <td><span class="badge-tier {{ tier }}">{{ u.tier or '—' }}</span></td>
+          <td>
+            <div class="roles-list" title="{{ (u.role_names or [])|join(', ') }}">
+              {{ (u.role_names or [])|length }} role(s):
+              {{ (u.role_names or [])|join(', ') or '—' }}
+            </div>
+          </td>
+          <td class="modules-list">{{ (u.module_prefixes or [])|join(', ') or '—' }}</td>
+          <td>{{ (u.eplant_ids or [])|join(', ') or '—' }}</td>
+          <td>
+            {% if u.active %}
+              <span class="badge-tier badge-active">Active</span>
+            {% else %}
+              <span class="badge-tier badge-inactive">Disabled</span>
+            {% endif %}
+          </td>
+          <td style="color:var(--fg2); font-size:0.78rem;">
+            {{ (u.last_login or '—')[:16] }}
+          </td>
+          <td class="row-actions">
+            <button class="btn-sm" onclick="viewUser('{{ u.username }}')">View</button>
+            <button class="btn-sm" onclick="refreshUser('{{ u.username }}')">Re-sync</button>
+            {% if u.username != username %}
+              {% if u.active %}
+                <button class="btn-sm btn-danger" onclick="setActive('{{ u.username }}', false)">Disable</button>
+              {% else %}
+                <button class="btn-sm" onclick="setActive('{{ u.username }}', true)">Enable</button>
+              {% endif %}
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" style="color:var(--fg2); text-align:center; padding:1rem;">
+          No SSO users yet — once a portal user signs in, they'll appear here.
+        </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
 
+  {# ------------------------------------------------------------------ #}
+  {# Legacy local accounts — break-glass, keep working for `admin`       #}
+  {# ------------------------------------------------------------------ #}
   <div class="card">
-    <h3>Users</h3>
-    <table class="user-table">
+    <h3>Local accounts (break-glass)</h3>
+    <div class="card-subtitle">
+      Password-based local users (legacy). Use only when SSO is unavailable.
+      Hayden's `hnester@nycoa.com` SSO account is hard-coded super-admin and
+      always has full access regardless of IQMS lookup state.
+    </div>
+
+    <details class="collapsible">
+      <summary>Add local user (advanced)</summary>
+      <form method="POST" action="{{ url_for('add_user') }}" style="margin-top:0.8rem;">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" name="username" required autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label>Display Name</label>
+            <input type="text" name="display_name" autocomplete="off">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" name="password" required autocomplete="new-password">
+        </div>
+        <div class="checkbox-group">
+          <input type="checkbox" name="is_admin" id="isAdmin">
+          <label for="isAdmin">Admin privileges</label>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:auto;">Add User</button>
+      </form>
+    </details>
+
+    <table class="user-table" style="margin-top:1rem;">
       <thead>
         <tr>
           <th>Username</th>
@@ -90,8 +236,7 @@
           <td>{{ udata.get('display_name', uname) }}</td>
           <td>{% if udata.get('is_admin') %}<span class="badge">Admin</span>{% else %}User{% endif %}</td>
           <td style="color:var(--fg2); font-size:0.85rem;">{{ udata.get('created', '—')[:10] }}</td>
-          <td style="display:flex; gap:0.3rem; flex-wrap:wrap;">
-            <!-- Reset password -->
+          <td class="row-actions">
             <form class="inline-form" method="POST" action="{{ url_for('reset_password') }}"
                   onsubmit="var pw=prompt('New password for {{ uname }}:'); if(!pw||pw.length<4){alert('Min 4 chars');return false;} this.querySelector('[name=new_password]').value=pw;">
               <input type="hidden" name="username" value="{{ uname }}">
@@ -99,7 +244,6 @@
               <button type="submit" class="btn-sm">Reset PW</button>
             </form>
             {% if uname != username %}
-            <!-- Delete -->
             <form class="inline-form" method="POST" action="{{ url_for('delete_user') }}"
                   onsubmit="return confirm('Delete {{ udata.get('display_name', uname) }}?');">
               <input type="hidden" name="username" value="{{ uname }}">
@@ -113,4 +257,97 @@
     </table>
   </div>
 </div>
+
+{# ------------------------------------------------------------------ #}
+{# Detail modal — full role list + raw_packet                          #}
+{# ------------------------------------------------------------------ #}
+<div class="modal-bg" id="userModalBg" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">Close</button>
+    <h3 id="modalTitle">User Detail</h3>
+    <div id="modalBody" style="margin-top:0.8rem;">Loading…</div>
+  </div>
+</div>
+
+<script>
+  // ------ filter -------------------------------------------------------
+  const filter = document.getElementById('ssoFilter');
+  if (filter) {
+    filter.addEventListener('input', () => {
+      const q = filter.value.toLowerCase().trim();
+      document.querySelectorAll('#ssoUsersTable tbody tr[data-username]').forEach(tr => {
+        const hay = tr.dataset.search || '';
+        tr.style.display = !q || hay.toLowerCase().includes(q) ? '' : 'none';
+      });
+    });
+  }
+
+  // ------ actions ------------------------------------------------------
+  async function setActive(username, active) {
+    if (!confirm(`${active ? 'Enable' : 'Disable'} ${username}?`)) return;
+    const r = await fetch(`/admin/users/${encodeURIComponent(username)}/active`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({active}),
+    });
+    if (r.ok) location.reload();
+    else alert((await r.json()).error || 'Failed');
+  }
+
+  async function refreshUser(username) {
+    const btn = event.target;
+    btn.disabled = true; btn.textContent = '…syncing';
+    try {
+      const r = await fetch(`/admin/users/${encodeURIComponent(username)}/refresh`, {
+        method: 'POST',
+      });
+      if (r.ok) location.reload();
+      else alert((await r.json()).error || 'Refresh failed');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function viewUser(username) {
+    document.getElementById('modalTitle').textContent = username;
+    document.getElementById('modalBody').innerHTML = 'Loading…';
+    document.getElementById('userModalBg').classList.add('show');
+    const r = await fetch(`/admin/users/${encodeURIComponent(username)}`);
+    if (!r.ok) {
+      document.getElementById('modalBody').textContent = 'Failed to load user';
+      return;
+    }
+    const data = await r.json();
+    const u = data.user || {};
+    const p = data.permissions || {};
+    const html = `
+      <div style="margin-bottom:0.8rem;">
+        <strong>Email:</strong> ${u.email || '—'}<br>
+        <strong>Display name:</strong> ${u.display_name || '—'}<br>
+        <strong>Active:</strong> ${u.active ? 'Yes' : 'No'}<br>
+        <strong>Super-admin:</strong> ${u.is_super_admin ? 'Yes' : 'No'}<br>
+        <strong>Created:</strong> ${u.created_at || '—'}<br>
+        <strong>Last login:</strong> ${u.last_login || '—'}<br>
+      </div>
+      <div style="margin-bottom:0.8rem;">
+        <strong>IQMS user name:</strong> ${p.iqms_user_name || '—'}<br>
+        <strong>Tier:</strong> ${p.tier || '—'}<br>
+        <strong>Synced:</strong> ${p.synced_at || '—'}<br>
+        <strong>ePlants:</strong> ${(p.eplant_ids || []).join(', ') || '—'}<br>
+        <strong>Module prefixes:</strong> ${(p.module_prefixes || []).join(', ') || '—'}<br>
+        <strong>Allowed table prefixes:</strong> ${(p.allowed_table_prefixes || []).join(', ') || '—'}<br>
+      </div>
+      <div style="margin-bottom:0.4rem;"><strong>Role names (${(p.role_names || []).length}):</strong></div>
+      <pre>${(p.role_names || []).join('\n') || '(none)'}</pre>
+      <details class="collapsible">
+        <summary>Raw packet (debug)</summary>
+        <pre>${JSON.stringify(p.raw_packet || p, null, 2)}</pre>
+      </details>
+    `;
+    document.getElementById('modalBody').innerHTML = html;
+  }
+
+  function closeModal() {
+    document.getElementById('userModalBg').classList.remove('show');
+  }
+</script>
 {% endblock %}

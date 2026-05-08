@@ -1,316 +1,327 @@
-# IQMS Chat — SSO Identity & Role-Based Permissions Design
+# IQMS Chat — SSO Identity & IQMS-Driven Permissions Design
 
-Status: design only (no code changed)
-Author: Permissions Architect agent
+Status: implemented (Phase 2)
+Authors: Permissions Architect agent (v1, design-only) → iqms-chat Phase 2 Engineer (v2, this version)
 Last updated: 2026-05-08
 
-## Goals
+> **What changed since v1?** The original design proposed a five-bucket role model
+> (viewer / operator / manager / executive / admin) with hand-curated denylists. Live
+> research against IQMS (`docs/iqms-permissions-research.md`) showed that's a step
+> backwards: IQMS already has 292 canonical roles, and any 5-bucket abstraction
+> misclassifies hybrid users like KFITZPATRICK (sales + read-only-less-finance,
+> 92 roles across ~40 modules). v2 of this design uses **IQMS roles directly**.
 
-1. Replace the current "every SSO visitor logs in as `admin`" hack (`app.py` `/sso` route, ~line 463–513) with real per-user identity sourced from the NYCOA Portal.
-2. Introduce role-based access control over which IQMS Oracle data domains a user can query.
-3. Layer enforcement so jailbreaks of the model alone don't leak HR/payroll/finance data.
+## 0. TL;DR — what got built
 
----
-
-## 1. SSO flow (target state)
-
-### 1a. Sequence (browser <-> portal <-> iqms-chat)
-
-```
-Browser              Portal (:4070)                       iqms-chat (:5055)
-   |                    |                                       |
-   | click IQMS Chat    |                                       |
-   |-------tile-------->|                                       |
-   |                    | GET /api/sso/iqms_chat?next=/         |
-   |                    | (authenticate middleware: portal JWT) |
-   |                    | lookupEmployee(email) -> directory    |
-   |                    | check directory.access['iqms_chat']   |
-   |                    | jwt.sign({email, full_name,           |
-   |                    |   portal_role}, PORTAL_SSO_SECRET,    |
-   |                    |   {iss:'nycoa-portal', aud:'iqms_chat',|
-   |                    |    expiresIn: 300})                   |
-   |                    | -> redirect_url ?ptoken=<jwt>&next=/  |
-   |<--JSON redirect----|                                       |
-   |--GET /sso?ptoken=<jwt>&next=/--------------------------->  |
-   |                                                            | jwt.decode(ptoken,
-   |                                                            |   PORTAL_SSO_SECRET,
-   |                                                            |   iss='nycoa-portal',
-   |                                                            |   aud='iqms_chat')
-   |                                                            | upsert user row, set session
-   |<------302 to /---------------------------------------------|
-```
-
-### 1b. JWT contract (portal already implements this)
-
-Source of truth: `/home/hnester/portal/server/src/routes/sso.ts`.
-
-- Algorithm: HS256, shared secret env `PORTAL_SSO_SECRET` (already wired on both ends — see iqms-chat `.env`).
-- Issuer: `nycoa-portal`
-- Audience: `iqms_chat` (per-module pin — a token minted for MOC will not validate here)
-- TTL: 300 s (one-shot login token; the iqms-chat Flask session takes over after exchange)
-- Payload claims: `{ email, full_name, portal_role }`. `portal_role` is one of `employee | manager | hr | admin` (from `/home/hnester/portal/packages/shared/src/constants.ts`). Standard JWT fields `iat`, `exp`, `iss`, `aud` are included by `jsonwebtoken`.
-- No `sub` claim is currently set. We will treat `email` (lowercased) as the canonical user key. If we later want a stable opaque identifier we should ask the portal team to add `sub: directory.id` — out of scope here.
-
-### 1c. iqms-chat verification + user mapping (replaces today's behavior)
-
-Today (`app.py` `/sso`): JWT is verified correctly, then **everyone is logged in as the local `admin` account** (`session["username"] = "admin"`, line 503). That is the line we are removing.
-
-Target behavior on a successful JWT decode:
-
-1. Lowercase `claims['email']`. Reject if missing.
-2. `db.upsert_user_from_sso(email, full_name, portal_role)`:
-   - If a row exists, update `display_name`, `last_login`, set `active=1` (re-activate previously deactivated users only after admin review — see open question below — for v1 we just bump `last_login`, not `active`).
-   - If no row, **auto-provision** a new user with default role `viewer` and `eplant_access = [1,2,3]` (all three plants — restricting plant access is a separate axis the admin can tune later). `active=1`.
-3. If the row is `active=0`, redirect back to `/login` with a flash "Account disabled — contact admin."
-4. Write Flask session: `username` = email, `display_name`, `role`, `is_admin = (role == 'admin')`, `eplant_access`, `chat_id`, `eplant_id` defaulted to first allowed plant.
-5. Log `Portal SSO sign-in for <email> -> role=<role>`.
-
-Recommended first-login policy: **auto-provision as `viewer` (active immediately)**. The chat is gated upstream by Portal directory `access['iqms_chat']`, so anyone reaching iqms-chat is already cleared by IT. `viewer` only sees production/inventory data — there is no leakage risk in giving them that automatically. Alternative ("admin must approve before any access") creates support tickets and helpdesk friction without a corresponding security gain. See open question Q1 for confirmation.
-
-### 1d. Logout / token expiry
-
-- iqms-chat session lifetime: keep the current Flask session default (browser session). No change.
-- Portal token (`ptoken`) is single-use in practice — only the `/sso` route consumes it. After exchange, all auth is the Flask session cookie. If a user idles past the Flask session and hits a protected route, they are redirected to `/login`, where they should re-enter via the portal tile (no local password for SSO users).
-- Logout (`/logout`) clears the Flask session as today; no portal-side logout call.
+- Portal SSO continues to mint a JWT (`/sso?ptoken=…`); we verify it.
+- On verify, look up the user's IQMS roles via `iqms_lookup.py` (Oracle SELECT
+  on `S_USER_GENERAL ⨝ S_USERS / S_GROUP_ROLES / S_USER_EPLANTS` — see
+  `docs/iqms-permissions-research.md` §3 for the query).
+- Persist the user (`users` table) and the resolved permission packet
+  (`iqms_permissions` table) into SQLite.
+- Inject a per-user "access control" block into the user prompt at `/ask` time
+  (Layer A — system-prompt enforcement; system prompt itself stays cacheable).
+- Emit the user's `allowed_table_prefixes` as `IQMS_ALLOWED_TABLE_PREFIXES`
+  (env, comma-separated) plus `allowedTablePrefixes` (config, JSON array)
+  in a per-request MCP config — Agent B reads this for Layer B enforcement.
+- Hardcoded super-admin override for `hnester@nycoa.com` so Hayden never gets
+  locked out by Oracle outages or schema drift.
 
 ---
 
-## 2. User record (post-SSO)
+## 1. SSO flow (no change from v1)
 
-Move from `data/users.json` to a new `users` table in the existing SQLite DB (`data/conversations.db`, managed by `db.py`).
+The browser/portal/iqms-chat handshake is unchanged from v1 §1a. The portal
+mints HS256 JWTs via `/home/hnester/portal/server/src/routes/sso.ts`,
+`iss=nycoa-portal`, `aud=iqms_chat`, 5-minute TTL. JWT shape:
+`{ email, full_name, portal_role, iat, exp, iss, aud }`.
 
-### 2a. Schema
+What changed is what `/sso` does after a successful decode:
+
+```python
+email = claims['email'].lower()
+is_super = email in SUPER_ADMIN_EMAILS  # {'hnester@nycoa.com'}
+
+packet = iqms_lookup.fetch_permissions_for_email(email)
+
+if is_super:
+    packet = _super_admin_packet(email, packet)   # forces module_prefixes=['*']
+elif not packet:
+    packet = _empty_permission_packet(email)      # no IQMS access — viewer tier
+
+db.upsert_user(email, email, full_name, is_super_admin=is_super)
+db.upsert_iqms_permissions(email, packet)
+
+# session cache (refreshed on every login)
+session['username'] = email
+session['display_name'] = full_name
+session['is_admin'] = is_super or 'IQALL' in packet['role_names']
+session['eplant_id'] = str(packet['eplant_ids'][0]) if packet['eplant_ids'] else '2'
+session['eplant_access'] = packet['eplant_ids']
+session['permission_packet'] = packet
+```
+
+If `users.active == 0`, redirect to `/login` with a flash. If the user is
+new, the row is auto-active (per Hayden's first-login decision — no pending
+state).
+
+The legacy local-account login (`/login` form) keeps working for the bootstrap
+`admin` account. SSO users have `pw_hash IS NULL` and cannot use the form.
+
+---
+
+## 2. Permission packet — single source of truth at runtime
+
+Every `/ask` reads `session['permission_packet']`, which is a dict with this
+shape:
+
+```python
+{
+  'iqms_user_name': 'HNESTER',                       # str | None
+  'email': 'hnester@nycoa.com',
+  'role_names': ['IQALL', 'IQALL_REPORTS', ...],     # raw IQMS role list
+  'module_prefixes': ['*'] or ['GL', 'AP', ...],     # derived; ['*'] = super-admin
+  'allowed_table_prefixes': ['%'] or ['GL%', ...],   # SQL LIKE patterns
+  'eplant_ids': [1, 2, 3],
+  'tier': 'admin' | 'operator' | 'viewer',           # UI cosmetic only
+  'synced_at': '2026-05-08T12:34:56Z',
+}
+```
+
+Persisted in `iqms_permissions` (PRIMARY KEY username FK→users). The full
+`raw_packet` is stored as JSON for forensics — admins can view it on the
+detail page (`/admin/users/<u>`).
+
+### 2.1 How the packet gets derived
+
+`iqms_lookup.fetch_permissions_for_email(email)`:
+
+1. Run the SQL query from `iqms-permissions-research.md` §3 → list of
+   `(USER_NAME, EMAIL, EPLANT_ID, SOURCE, GRANTED_ROLE)` rows.
+2. Dedupe role names (`role_names`).
+3. Dedupe ePlant IDs (`eplant_ids`).
+4. Derive `module_prefixes` per role: regex `^IQ([A-Z0-9_]+?)(_RO|_RW|$)` →
+   capture group 1. NYCOA / NBS / SHAW custom roles preserve their full
+   prefix (e.g. `NYCOA_SMARTPAGE_BI_RW` → `NYCOA_SMARTPAGE_BI`).
+5. Map module prefixes → table-prefix LIKE patterns via the
+   `MODULE_TABLE_PREFIXES` table (in `iqms_lookup.py`). Always allow
+   `S_%` and `EPLANT%` so users can resolve their own context.
+   `IQALL` → `["%"]` short-circuits (full read).
+6. Derive `tier`: `IQALL` → admin; any `*_RW` → operator; only `*_RO` →
+   viewer. (Tier is **cosmetic only** — it drives the UI badge and that's
+   it. All actual gating uses `module_prefixes` and `allowed_table_prefixes`.)
+
+If Oracle is unreachable or the query times out, `fetch_permissions_for_email`
+returns `None`. The caller (`/sso`) decides what to do:
+
+- Super-admin → synthesize a full-access packet anyway (Hayden never locked out).
+- Non-super-admin → "no IQMS access" packet (empty arrays, viewer tier).
+  The user can still chat about non-IQMS topics; the system prompt will block
+  every DB query.
+
+---
+
+## 3. We use IQMS roles directly — no five-bucket abstraction
+
+The original architect proposed five iqms-chat roles: `viewer`, `operator`,
+`manager`, `executive`, `admin`, with hand-curated table denylists per role.
+
+**This design is dropped.** The detailed reasoning is in
+`docs/iqms-permissions-research.md` §5. The short version:
+
+- IQMS has 292 canonical roles already. Reinventing 5 buckets means
+  hand-mapping every IQMS role into a bucket — and roles like
+  `IQVENDOR_RMA_RW`, `NYCOA_SMARTPAGE_BI_RW`, `IQALL_REPORTS` don't fit
+  cleanly anywhere.
+- Hybrid users (e.g. KFITZPATRICK with 92 effective roles) get misclassified
+  no matter which bucket you pick.
+- The denylist needs to be maintained by someone every time IQMS adds a new
+  role. That someone doesn't exist.
+- IQMS roles already encode "what tables this user can read" via the role's
+  module prefix. We just expose that.
+
+**Tier (admin / operator / viewer)** survives, but only as a UI badge so the
+admin user list shows something at-a-glance. Real gating is by raw role
+list + derived `allowed_table_prefixes`.
+
+---
+
+## 4. Enforcement — Layer A (this code) + Layer B (Agent B)
+
+### 4.1 Layer A — system-prompt enforcement (this PR)
+
+In `app.py` `/ask`, we inject an "access control" block into the user prompt
+(not the system prompt — keeping the system prompt user-agnostic + cacheable
+matters because we pay for prompt caching). The block looks like:
+
+```
+=== Access control ===
+You are answering on behalf of: <name> (<email>)
+Tier: <tier>
+Allowed IQMS module prefixes: <comma-separated module list>
+Allowed table name patterns: <comma-separated SQL LIKE patterns>
+
+You MUST refuse any query that would read from a table not matching one of
+the allowed patterns above. Specifically, the following modules are FORBIDDEN
+for this user unless explicitly listed above:
+  Payroll / Time & Attendance (PR_*, DAY_*EMP*, DAY_HRS, DAY_LABOR_PROJECT);
+  General Ledger (GL%, GLACCT, FRL_ACCT_*);
+  Accounts Payable / Vendor financials (AP%, VEND%, PO%);
+  Accounts Receivable / Customer credit (ARCUSTO, AR%, AKA%);
+  HR (EMP_*, S_USER_GENERAL, S_USERS);
+  System administration (EDI_*, IQALERT*, S_SYS*)
+
+If the user asks for data you cannot provide, respond with:
+"I'm sorry — your account does not have access to {module} data in IQMS.
+ Contact your admin to request access."
+Do not attempt the query.
+
+The MCP allowlist (Layer B) will also block these queries server-side, so
+even if you attempt them they will fail. Refuse cleanly and inform the user.
+=== End access control ===
+```
+
+The block is **omitted entirely** when `module_prefixes == ['*']` (super-admin
+/ IQALL). For users with no IQMS roles at all, the block reads "Tier: no IQMS
+access" and instructs Claude to refuse every DB query.
+
+### 4.2 Layer B — MCP allowlist (Agent B's code, this PR's contract)
+
+`/ask` writes a per-request MCP config with the user's `allowed_table_prefixes`.
+The iqms-oracle MCP server (in `/home/hnester/iqms-plugin/`) reads this and
+enforces it at the tool level — `list-tables` filters, `query` rejects matching
+tables, etc.
+
+**Contract for Agent B**:
+- `mcpServers["iqms-oracle"].env.IQMS_ALLOWED_TABLE_PREFIXES` — comma-separated
+  string of SQL LIKE patterns. Whitespace around commas is tolerated.
+- `mcpServers["iqms-oracle"].allowedTablePrefixes` — JSON array form of the
+  same. Agent B may read either; if both are present, prefer the config-level
+  array.
+- When the user is a super-admin (`module_prefixes == ['*']`), neither key is
+  emitted. The MCP defaults to no filtering.
+- Empty list / missing key = no filtering (default). Empty list semantically
+  means "no IQMS access at all" — but Layer A blocks the query before it ever
+  reaches the MCP, and Layer B can choose to enforce empty-list as "deny all"
+  for defense in depth.
+
+---
+
+## 5. SQLite schema additions (Phase 2)
+
+Both tables are auto-created in `db.py` on first import (idempotent CREATE IF
+NOT EXISTS).
 
 ```sql
-CREATE TABLE IF NOT EXISTS users (
-  username       TEXT PRIMARY KEY,         -- canonical = lowercased email for SSO users; "admin" for legacy
-  email          TEXT UNIQUE,              -- nullable for legacy local accounts
+CREATE TABLE users (
+  username       TEXT PRIMARY KEY,         -- canonical = lowercased email; "admin" for legacy
+  email          TEXT UNIQUE,
   display_name   TEXT NOT NULL,
-  role           TEXT NOT NULL CHECK(role IN ('viewer','operator','manager','executive','admin')),
-  eplant_access  TEXT NOT NULL DEFAULT '[1,2,3]',  -- JSON array of allowed EPLANT_IDs
   active         INTEGER NOT NULL DEFAULT 1,
-  portal_role    TEXT,                     -- mirror of JWT portal_role at last login
-  pw_hash        TEXT,                     -- only populated for legacy local accounts
+  is_super_admin INTEGER NOT NULL DEFAULT 0,
+  pw_hash        TEXT,                     -- only for legacy local accounts
   pw_salt        TEXT,
   created_at     TEXT NOT NULL,
   last_login     TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX idx_users_email ON users(email);
+
+CREATE TABLE iqms_permissions (
+  username                TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+  iqms_user_name          TEXT,
+  role_names              TEXT NOT NULL,    -- JSON array
+  module_prefixes         TEXT NOT NULL,    -- JSON array
+  allowed_table_prefixes  TEXT NOT NULL,    -- JSON array of LIKE patterns
+  eplant_ids              TEXT NOT NULL,    -- JSON array
+  tier                    TEXT NOT NULL CHECK(tier IN ('viewer','operator','admin')),
+  synced_at               TEXT NOT NULL,
+  raw_packet              TEXT              -- full JSON for forensics
+);
 ```
 
-### 2b. Coexistence with existing local `admin`
+Helpers in `db.py`: `upsert_user`, `get_user`, `set_user_active`,
+`touch_last_login`, `list_users` (joined view), `upsert_iqms_permissions`,
+`get_iqms_permissions`.
 
-- Migration script (one-off, idempotent): read `data/users.json`, insert into `users` with `role='admin'`, `eplant_access='[1,2,3]'`, copy `hash`/`salt` into `pw_hash`/`pw_salt`. Keep `users.json` on disk as a backup until v1 has been live for a week.
-- Login form (`/login`) keeps working for accounts with `pw_hash IS NOT NULL`. SSO-provisioned users have a null hash and **cannot** log in via the form (good — they have no password).
-- This means Hayden's existing `admin` login keeps working through the rollout.
-
-### 2c. Mapping portal_role -> initial iqms-chat role
-
-Only used at first auto-provision; admins can override in the user list afterward.
-
-| portal_role | initial iqms-chat role |
-|---|---|
-| `employee` | `viewer` |
-| `manager`  | `viewer` (NOT `manager` — the iqms-chat `manager` role grants finance read; many portal "managers" are line leads who don't need that. Promote manually.) |
-| `hr`       | `viewer` (HR users opt into payroll role only after admin assignment) |
-| `admin`    | `admin` (portal admins flow straight through) |
+A one-shot `scripts/migrate_users_json.py` migrates `data/users.json` into
+the `users` table (idempotent — skips usernames that already exist). Runs
+automatically at app startup so the legacy admin row lands without manual
+intervention.
 
 ---
 
-## 3. Role definitions
+## 6. Admin UI (Phase 2)
 
-Five roles. All roles can chat; the differences are in (a) which IQMS modules/tables they can ask about, and (b) admin capabilities.
+The admin page at `/admin` now renders **two cards**:
 
-Tables called out below come from `~/.claude/agent-memory/erp-database/module-reference.md` and confirmed cross-references in `foreign-keys.md`. Wildcards are SQL-style; matching is case-insensitive on table name.
+1. **SSO Users** (primary) — table of every user provisioned via portal SSO,
+   with email, display name, tier badge, role count + role names tooltip,
+   module prefixes, ePlant access, active status, last login. Buttons:
+   - **View** → modal with full role list + raw packet JSON.
+   - **Re-sync** → POSTs `/admin/users/<u>/refresh`, re-pulls IQMS, persists.
+   - **Disable / Enable** → POSTs `/admin/users/<u>/active` with `{active: bool}`.
+   - Client-side filter input over email/name/role-name.
+2. **Local accounts (break-glass)** — the original users.json table. Add
+   user form is hidden inside an "Advanced" `<details>` collapsible. Reset
+   PW / Delete actions still work for the legacy admin.
 
-### 3.1 `viewer` (default)
+New API routes:
+- `GET /admin/users` — list (HTML or JSON via `?format=json` or `Accept: application/json`).
+- `GET /admin/users/<username>` — JSON detail for one user (used by the modal).
+- `POST /admin/users/<username>/active` — body `{active: bool}` → `{ok: true}`.
+- `POST /admin/users/<username>/refresh` — re-pull and persist; returns the
+  updated packet.
 
-- **Modules**: Manufacturing, basic Quality, Inventory.
-- **Allowed tables** (allowlist mode is too restrictive — we use a denylist):
-- **Denied table prefixes / exact names**:
-  - Payroll/T&A: `PR_EMP`, `PR_PAYTYPE`, `PR_DEDUCTION`, `PR_TAX`, `DAY_EMP`, `DAY_HRS`, `DAY_LABOR_PROJECT`, any `PR_*`, `DAY_*EMP*`
-  - Finance/GL: `GLACCT`, `GLPERIODS`, `FRL_ACCT_*`, `ACCRUED_FREIGHT*`, `ARINVOICE*`
-  - AP/Vendor financials: `VENDOR` (full row deny — vendor names leak pricing context), `PO` (PO pricing), `ARCUSTO` (customer terms), `SHIP_TO`, `BILL_TO`
-  - Pricing: `AKA`, `AKA_BREAKS`, `STANDARD` (cost columns — the table is needed for BOM lookups; soft-deny via prompt only — see Layer A below)
-  - HR/Security: `S_USER_GENERAL`, `S_USERS`, `S_ROLE`, `EMP_*`
-  - System Admin: `EDI_*`, `IQALERT*`, anything `S_SYS*`
-- **ePlants**: all by default (per-user override allowed).
-- **Reports**: yes (markdown reports of allowed data).
-- **Admin caps**: none.
-
-### 3.2 `operator`
-
-- Everything `viewer` has, **plus**:
-  - Sales orders header/lines: `ORDERS`, `ORD_DETAIL`, `RELEASES`, `SHIPMENT_DTL` (qty, dates — but not pricing columns; soft-restricted via prompt).
-  - Extended quality: `CAR_HDR`, `CAR_DTL`, `SPC_*`, `QINVT`, `DHR`, `DHR_DTL`, `APQP*`, `ECO`.
-  - Customer master read **without financial fields**: `ARCUSTO` is allowed but the prompt instructs Claude to never SELECT `CREDIT_LIMIT`, `TERMS_*`, `BALANCE_*`, `YTD_*` columns.
-- Still denied: payroll, GL, AP, vendor pricing, system admin.
-
-### 3.3 `manager`
-
-- Everything `operator` has, **plus**:
-  - Costing summaries: `STANDARD` cost columns, costing analysis from `ARINVT`.
-  - GL read for management reporting: `GLACCT`, `GLPERIODS`, `FRL_ACCT_*`.
-  - AP summaries: `VENDOR`, `PO`, `ACCRUED_FREIGHT*`, `ARINVOICE*`.
-  - Pricing: `AKA`, `AKA_BREAKS`, full `ARCUSTO` (terms, credit).
-- Still denied: payroll/T&A (`PR_*`, `DAY_EMP`, `DAY_HRS`, `DAY_LABOR_PROJECT`), HR (`S_USER*`, `EMP_*`), system admin (`IQALERT*`, `EDI_*`).
-
-### 3.4 `executive`
-
-- Everything `manager` has, **plus**: payroll/T&A and HR read (`PR_*`, `DAY_EMP`, `DAY_HRS`, `DAY_LABOR_PROJECT`, `EMP_*`).
-- Denied only: system admin (`IQALERT*`, `EDI_*`, `S_USER_GENERAL`, `S_ROLE`).
-- Reports: yes.
-- Admin caps: none in iqms-chat (read-only of IQMS, not iqms-chat user mgmt).
-
-### 3.5 `admin`
-
-- Full IQMS read (no IQMS denylist).
-- iqms-chat user management: list users, change role, change ePlant access, deactivate, reactivate.
-- Logs view: full.
-
-### 3.6 Role -> denylist as data
-
-Denylists are static config — store in `app/permissions.py` as a Python dict keyed by role:
-```
-ROLE_DENYLIST = {
-  'viewer':    ['PR_*','DAY_EMP','DAY_HRS','DAY_LABOR_PROJECT','GLACCT','GL*','FRL_ACCT_*','ACCRUED_FREIGHT*','ARINVOICE*','VENDOR','PO','ARCUSTO','SHIP_TO','BILL_TO','AKA','AKA_BREAKS','S_USER*','S_USERS','S_ROLE','EMP_*','EDI_*','IQALERT*','S_SYS*'],
-  'operator':  ['PR_*','DAY_EMP','DAY_HRS','DAY_LABOR_PROJECT','GLACCT','GL*','FRL_ACCT_*','ACCRUED_FREIGHT*','ARINVOICE*','VENDOR','PO','AKA','AKA_BREAKS','S_USER*','S_USERS','S_ROLE','EMP_*','EDI_*','IQALERT*','S_SYS*'],
-  'manager':   ['PR_*','DAY_EMP','DAY_HRS','DAY_LABOR_PROJECT','S_USER*','S_USERS','S_ROLE','EMP_*','EDI_*','IQALERT*','S_SYS*'],
-  'executive': ['EDI_*','IQALERT*','S_USER_GENERAL','S_ROLE'],
-  'admin':     [],
-}
-```
-A small unit test enforces "PR_* denied for everyone except executive and admin" so future edits don't regress.
+All routes are `@admin_required`.
 
 ---
 
-## 4. Enforcement strategy
+## 7. Super-admin override
 
-Three possible layers; we recommend **A immediately, B in Phase 3, C parked as future hardening.**
+`SUPER_ADMIN_EMAILS = {"hnester@nycoa.com"}` (in `app.py`).
 
-### Layer A — System prompt denylist (recommended for v1)
+When `email in SUPER_ADMIN_EMAILS`:
+- `is_super_admin = 1` on the `users` row.
+- Permission packet is **always** synthesized to:
+  `module_prefixes=['*']`, `allowed_table_prefixes=['%']`, `tier='admin'`,
+  `eplant_ids=[1,2,3]`. Any IQMS roles found get appended (so the admin UI
+  shows the real role list), but the gating fields are hard-coded.
+- Layer A access-control block is **omitted** entirely.
+- Layer B `IQMS_ALLOWED_TABLE_PREFIXES` is **omitted** (no filtering).
 
-Inject the user's denylist into the system prompt sent to `claude -p` (`app.py` lines 789–801). Add a new section to `SYSTEM_PROMPT_TEMPLATE`:
-
-```
-ACCESS CONTROL — STRICT:
-The current user is "<email>" with role "<role>". You MUST NOT query or describe data
-from these table prefixes/names: <comma-separated denylist>.
-If the user asks a question that would require those tables, refuse with:
-"That data isn't available to your role. Contact <admin contact> if you need access."
-Do not list the denied tables back to the user; just refuse the specific request.
-```
-
-- Pros: trivial to ship, no MCP changes, fully auditable in logs.
-- Cons: prompt-injection / jailbreak can in principle be talked past. Acceptable for `viewer`/`operator` since the data behind the denylist (payroll, GL) carries higher-tier business risk; B closes that gap.
-
-### Layer B — MCP-level filtering (recommended for Phase 3)
-
-Modify the iqms-oracle MCP (`/home/hnester/iqms-plugin/plugins/iqms-team-tools/mcp-servers/iqms-oracle/index.js`) to honor an `IQMS_TABLE_DENYLIST` env var (comma-separated patterns):
-
-- `list-tables` filters out matching tables.
-- `describe-table`, `sample-data`, `row-count`, `table-indexes`, `table-relationships`, `search-columns` return "table not accessible to your role" for matches.
-- `query` parses the SQL and rejects if any matched table name appears as a token (simple regex per pattern; SQL parsing libraries are overkill for SELECT-only). Failure mode is reject — false positives are tolerable.
-
-iqms-chat passes the denylist by **regenerating the MCP config per request** instead of using the two static configs (`MCP_CONFIG_IQMS`, `MCP_CONFIG_ALL`). New helper `build_mcp_config(role, eplant_id)` writes a tmp JSON in `data/tmp/mcp_<chatid>_<turn>.json` that injects the denylist into `IQMS_MCP['env']['IQMS_TABLE_DENYLIST']`. Pass that path to `--mcp-config`. Clean up the tmp file after `subprocess.run` returns.
-
-This is the security floor we want under Layer A's UX.
-
-### Layer C — Oracle VPD or per-role DB users (future)
-
-- Create separate Oracle read-only users (`mcp_viewer`, `mcp_operator`, `mcp_manager`, `mcp_exec`, `mcp_admin`), each with `GRANT SELECT` only on permitted tables. Switch the MCP env `IQMS_DB_USER` per role.
-- VPD policies on `IQMS.PR_*` etc. are even tighter but require IQMS DBA buy-in (changes to a vendor schema are sensitive).
-- Park this until Layers A+B have been live and we have data on the actual query patterns.
+This is deliberate: even if Oracle is down, IQMS account is renamed, or
+some future audit query returns 0 rows, Hayden gets full access.
 
 ---
 
-## 5. Admin UI changes
+## 8. Open / deferred
 
-Add to `templates/admin.html` (replacing the current users-list block):
-
-- **User list table**: email, display_name, role (dropdown: viewer/operator/manager/executive/admin), ePlant access (multi-select 1/2/3), active toggle, last_login, "Save" button per row.
-- **New user**: not needed — SSO auto-provisions. Keep the existing "create local user" form behind an "Advanced" toggle for emergency local accounts.
-- **Search/filter**: by email substring + role. Useful as user count grows past ~20.
-
-Backend routes (Flask, `app.py`):
-- `GET /admin/users` — JSON list.
-- `POST /admin/users/<email>/role` — change role; admin-only.
-- `POST /admin/users/<email>/eplants` — change ePlant access; admin-only.
-- `POST /admin/users/<email>/active` — toggle active; admin-only.
-
-Logs page (`templates/logs.html`): no schema change required, but add a "User" filter column and ensure every query logs `username=<email>` (already done in `app.py` line 824 — just confirm post-SSO it's the email, not "admin").
-
----
-
-## 6. Migration plan
-
-| Phase | Scope | Files touched |
-|---|---|---|
-| **A** | Add `users` table to `db.py`. Migrate `users.json` -> table. Replace `/sso` handler to upsert per-user. Add role/eplant_access to session. Keep local `admin` login working. | `db.py`, `app.py` (/sso, /login, /logout, login_required) |
-| **B** | Layer A enforcement: inject denylist into system prompt. Add `permissions.py` with `ROLE_DENYLIST`. Update `SYSTEM_PROMPT_TEMPLATE`. Per-request MCP config rebuild scaffolded but not yet adding role env. | `app.py`, new `permissions.py`, prompt template |
-| **C** | Admin UI: user list table, role/eplant editor, active toggle. Routes for admin user mgmt. | `templates/admin.html`, `app.py` admin routes |
-| **D** | Layer B enforcement: MCP-side denylist. Per-request MCP config now writes denylist env. Add `IQMS_TABLE_DENYLIST` parsing in `index.js`. | `iqms-plugin/plugins/iqms-team-tools/mcp-servers/iqms-oracle/index.js` (separate repo!), `app.py` MCP config builder |
-| **E** | Audit log: dedicated `query_log` table — user, timestamp, prompt, denied? (bool), elapsed, mcp_config_path. View on logs page. | `db.py`, `app.py`, `templates/logs.html` |
-
-Phases A-C ship first as the user-visible feature. D requires a parallel PR to the iqms-plugin repo and a coordinated deploy. E is gravy but cheap.
+- **Q1 (first-login policy)**: ANSWERED — auto-active.
+- **Q2 (manager mapping)**: OBSOLETE — no `manager` role anymore; we use
+  IQMS roles.
+- **Q3, Q4 (column-level restrictions on ARCUSTO / STANDARD)**: still open;
+  Layer A prompt currently doesn't list specific column restrictions.
+  Defer until we see actual queries that need this.
+- **Q5 (offboarding)**: ANSWERED — deactivate, retain history.
+- **Q6 (local admin long-term)**: ANSWERED — keep as break-glass.
+- **Layer C (Oracle VPD / per-role DB users)**: still parked. Revisit after
+  Layers A+B have been live for a quarter.
+- **`DBA_TAB_PRIVS` audit**: research doc §4 still wants a DBA-run dump of
+  exact role→table grants. Once available, the `MODULE_TABLE_PREFIXES`
+  starter map in `iqms_lookup.py` should be replaced with the authoritative
+  data. Not a Phase 2 blocker.
 
 ---
 
-## 7. Open questions for Hayden
+## 9. Files in this PR
 
-1. **Q1 — First-login policy**: Should new SSO users be auto-active at `viewer` role, or sit in a "pending" state until an admin promotes them? (Recommend auto-active viewer; portal directory already gates iqms-chat access upstream.)
-2. **Q2 — Manager mapping**: Should `portal_role='manager'` auto-map to iqms-chat `manager` (gets finance/costing) or default to `viewer` and require explicit promotion? (Recommend default to `viewer` — portal "manager" is too broad.)
-3. **Q3 — `ARCUSTO` and credit/financials**: For `operator` role, do we soft-restrict (prompt-level) credit/terms columns or fully deny the `ARCUSTO` table? (Recommend soft-restrict — operators legitimately need customer name/contact, just not credit.)
-4. **Q4 — `STANDARD` table cost columns**: `STANDARD` is core for BOMs (operator needs it) but holds costs (manager+ only). Same soft-restrict approach via prompt, or split into two roles? (Recommend soft-restrict, log queries that mention cost columns for spot audit.)
-5. **Q5 — Disable vs delete**: When a portal user is offboarded, do we keep their iqms-chat history (deactivate row) or scrub it? (Recommend deactivate + retain — chat history may be relevant evidence.)
-6. **Q6 — Local `admin` long-term**: Once SSO is live, do we keep the password-based local `admin` as a break-glass account or remove it? (Recommend keep — useful when portal is down.)
-
----
-
-## 8. Phase 2 implementation breakdown (parallel agents)
-
-Three agents, non-overlapping file scopes. All three can run in parallel after Phase A merges (Phase A is single-agent because it changes the auth contract).
-
-### Agent 1 — "Auth & User Store" (Phase A)
-- **Owns**: `db.py` (add `users` table + helpers), `app.py` `/sso`, `/login`, `/logout`, `login_required`, session shape.
-- **Deliverables**:
-  - `db.upsert_user_from_sso(email, full_name, portal_role) -> dict`
-  - `db.get_user(username) -> dict | None`
-  - `db.list_users() -> list[dict]`
-  - `db.set_user_role(username, role)`, `db.set_user_eplants(username, eplants)`, `db.set_user_active(username, active)`
-  - One-shot `scripts/migrate_users_json.py`
-  - `/sso` rewritten to upsert per-user; remove the hardcoded admin mapping.
-  - Tests in `tests/test_users.py`.
-
-### Agent 2 — "Permissions Enforcement" (Phases B + D scaffolding)
-- **Owns**: new `permissions.py`, the system prompt template constant in `app.py`, the MCP config builder.
-- **Deliverables**:
-  - `permissions.py` exporting `ROLE_DENYLIST`, `denylist_for(role) -> list[str]`, `format_denylist_prompt(role, email) -> str`.
-  - Modify `SYSTEM_PROMPT_TEMPLATE` to include `{access_control}` and pass it from the chat handler.
-  - Refactor MCP config write from module-load static files to `build_mcp_config(role, is_nycoa) -> Path`; tmp files in `data/tmp/`.
-  - Tests in `tests/test_permissions.py`.
-- **Depends on**: Agent 1 having added `role` to `session`.
-
-### Agent 3 — "Admin UI" (Phase C)
-- **Owns**: `templates/admin.html`, admin-only Flask routes in `app.py` (`/admin/users` and the three POST routes).
-- **Deliverables**:
-  - User list table with role dropdown, eplant multi-select, active toggle, save button.
-  - Search box (client-side filter).
-  - Three new POST routes wired to Agent 1's `db` helpers.
-  - Tests in `tests/test_admin_users.py` (HTTP-level, using Flask test client).
-- **Depends on**: Agent 1's `db` helpers, but does NOT touch `db.py` itself.
-
-File-scope matrix (no overlap):
-
-| File | Agent 1 | Agent 2 | Agent 3 |
-|---|---|---|---|
-| `db.py` | edit | - | - |
-| `app.py` /sso, /login, /logout, login_required, session | edit | - | - |
-| `app.py` SYSTEM_PROMPT_TEMPLATE + chat handler prompt assembly + MCP config | - | edit | - |
-| `app.py` /admin/users routes | - | - | edit |
-| new `permissions.py` | - | create | - |
-| `templates/admin.html` | - | - | edit |
-| `scripts/migrate_users_json.py` | create | - | - |
-| `tests/` | test_users.py | test_permissions.py | test_admin_users.py |
-
-The MCP-side change (Layer B, in the iqms-plugin repo) is its own separate PR/agent post-Phase 2 — we are not touching that repo in this round.
+- `db.py` — added `users` + `iqms_permissions` tables and helpers.
+- `iqms_lookup.py` — new (Oracle query module, module/table-prefix derivation).
+- `app.py` — `/sso` rewrite, `/login` reads SQLite first, Layer A access-control
+  injection, per-request MCP config writer, new admin user-management routes.
+- `templates/admin.html` — SSO Users card + detail modal + filter; legacy
+  local accounts moved to a secondary card.
+- `scripts/migrate_users_json.py` — one-shot legacy migration.
+- `.env` — added `IQMS_DB_USER`, `IQMS_DB_PASSWORD`, `IQMS_DB_DSN`,
+  `ORACLE_CLIENT_LIB_DIR` (same creds as the iqms-oracle MCP).
+- `docs/permissions-design.md` — this file.
