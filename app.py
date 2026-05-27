@@ -38,6 +38,15 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
 
+
+@app.context_processor
+def inject_portal_chrome():
+    """PORTAL_URL + CLARITY_PROJECT_ID exposed to base.html."""
+    return {
+        "PORTAL_URL": os.environ.get("PORTAL_URL", ""),
+        "CLARITY_PROJECT_ID": os.environ.get("CLARITY_PROJECT_ID", ""),
+    }
+
 # ---------------------------------------------------------------------------
 # In-memory log buffer (last 500 entries)
 # ---------------------------------------------------------------------------

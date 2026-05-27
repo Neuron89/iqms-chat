@@ -69,9 +69,43 @@
   .btn-danger { background: #7f1d1d; color: #fca5a5; }
   .btn-danger:hover { background: var(--red); color: #fff; }
 </style>
+{% if CLARITY_PROJECT_ID %}
+<script type="text/javascript">
+  (function(c,l,a,r,i,t,y){
+    c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
+    t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
+    y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
+  })(window, document, "clarity", "script", "{{ CLARITY_PROJECT_ID }}");
+</script>
+{% endif %}
+<style>
+  .portal-back-link {
+    position: fixed; top: 12px; left: 12px; z-index: 9999;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; color: rgba(255,255,255,0.75);
+    background: rgba(0,0,0,0.55);
+    border: 1px solid rgba(255,255,255,0.14);
+    text-decoration: none; backdrop-filter: blur(6px);
+    transition: color .15s, background .15s, border-color .15s;
+  }
+  .portal-back-link:hover {
+    color: #fff; background: rgba(0,0,0,0.75);
+    border-color: rgba(255,255,255,0.30);
+  }
+  .portal-back-link svg { transition: transform .15s; }
+  .portal-back-link:hover svg { transform: translateX(-2px); }
+</style>
 {% block head %}{% endblock %}
 </head>
 <body>
+{% if PORTAL_URL %}
+<a href="{{ PORTAL_URL }}" class="portal-back-link" title="Back to NYCOA Portal">
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>
+  <span>Portal</span>
+</a>
+{% endif %}
 {% block body %}{% endblock %}
 </body>
 </html>
