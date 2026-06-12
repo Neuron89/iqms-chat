@@ -178,7 +178,7 @@ def _connect():
     _ensure_oracle_client()
     user = os.environ.get("IQMS_DB_USER", "mcp_readonly")
     password = os.environ.get("IQMS_DB_PASSWORD", "")
-    dsn = os.environ.get("IQMS_DB_DSN", "10.224.100.118:1521/IQMS")
+    dsn = os.environ.get("IQMS_DB_DSN", "10.224.100.59:1521/IQMS")
     if not password:
         raise RuntimeError(
             "IQMS_DB_PASSWORD not set; cannot connect to IQMS Oracle."
