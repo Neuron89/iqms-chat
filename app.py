@@ -690,6 +690,17 @@ def _resolve_permission_packet(email: str, *, is_super: bool) -> dict:
     if is_super:
         return _super_admin_packet(email, packet)
     if not packet:
+        # Live lookup failed (e.g. transient Oracle outage / cutover).
+        # Fall back to the last-known-good cached packet so a momentary
+        # blip does not silently lock a legitimate user out. Only reuse a
+        # cached packet that actually carried access.
+        cached = db.get_iqms_permissions(email)
+        if cached and (cached.get("role_names") or cached.get("module_prefixes")):
+            log_warn(
+                f"IQMS lookup failed for {email}; using last-known-good "
+                f"cached packet ({len(cached.get('role_names') or [])} roles)"
+            )
+            return cached
         return _empty_permission_packet(email)
     return packet
 

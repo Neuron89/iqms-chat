@@ -183,7 +183,12 @@ def _connect():
         raise RuntimeError(
             "IQMS_DB_PASSWORD not set; cannot connect to IQMS Oracle."
         )
-    return oracledb.connect(user=user, password=password, dsn=dsn)
+    # tcp_connect_timeout bounds how long a dead/cutover DB host can hang
+    # the SSO request; the retry in fetch_permissions_for_email handles
+    # momentary blips.
+    return oracledb.connect(
+        user=user, password=password, dsn=dsn, tcp_connect_timeout=5,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +227,21 @@ def fetch_permissions_for_email(email: str) -> Optional[dict]:
         return None
     email = email.lower()
 
-    try:
-        conn = _connect()
-    except Exception as exc:
-        logger.warning("IQMS lookup: cannot connect to Oracle (%s)", exc)
+    # Light retry — a single transient ORA-12170 / blip should not fail a
+    # legitimate login. Each attempt is bounded by tcp_connect_timeout.
+    conn = None
+    last_exc = None
+    for _attempt in range(2):
+        try:
+            conn = _connect()
+            break
+        except Exception as exc:
+            last_exc = exc
+    if conn is None:
+        logger.warning(
+            "IQMS lookup: cannot connect to Oracle after retries (%s)",
+            last_exc,
+        )
         return None
 
     try:
